@@ -46,7 +46,7 @@ void handle_client(int client_socket) {
         return;
     }
 
-    std::string response = "Proxy Cloud JF\r\n"
+    std::string response = "HTTP/1.1 101 Proxy Cloud JF\r\n"
                            "Upgrade: websocket\r\n"
                            "Connection: Upgrade\r\n\r\n";
     send(client_socket, response.c_str(), response.size(), 0);
