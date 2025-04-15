@@ -46,7 +46,7 @@ void handle_client(int client_socket) {
         return;
     }
 
-    std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
+    std::string response = "Proxy Cloud JF\r\n"
                            "Upgrade: websocket\r\n"
                            "Connection: Upgrade\r\n\r\n";
     send(client_socket, response.c_str(), response.size(), 0);
@@ -142,7 +142,7 @@ void run_proxy(int port) {
     pid_file << getpid();
     pid_file.close();
 
-    log("🟢 Proxy WebSocket ativo na porta " + std::to_string(port) + ". Aguardando conexões...");
+    log("🟢 Proxy Cloud JF ativo na porta " + std::to_string(port) + ". Aguardando conexões...");
     running = true;
 
     while (running) {
@@ -178,7 +178,7 @@ void start_daemon(int port) {
 void menu() {
     std::string opcao;
     while (true) {
-        std::cout << "==== MENU DO PROXY ====\n";
+        std::cout << "==== MENU DO PROXY Cloud JF ====\n";
         std::cout << "⚠️  O Proxy não funciona com OpenVPN\n";
         std::cout << "1. Abrir proxy\n";
         std::cout << "2. Fechar proxy\n";
@@ -193,6 +193,7 @@ void menu() {
             } else {
                 std::cout << "Digite a porta: ";
                 std::cin >> port_global;
+                std::cout << "Proxy Iniciado Agora seja Feliz";
 
                 if (is_port_in_use(port_global)) {
                     std::cout << "❌ Porta já está em uso.\n";
