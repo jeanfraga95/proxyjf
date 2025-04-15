@@ -1,219 +1,71 @@
-const { Telegraf } = require('telegraf');
-const MercadoPago = require('mercadopago');
-const fs = require('fs');
-const QRCode = require('qrcode-terminal');
-const express = require('express');
+#!/bin/bash
 
-// Configurar o Mercado Pago com o seu Access Token
-MercadoPago.configurations.setAccessToken('APP_USR-2895308821549951-101213-dd741d1833986338f8bbb516b979e643-273879961');
+# === CONFIGURAÇÕES ===
+GIST_IPS_URL="https://gist.githubusercontent.com/jeanfraga95/f3b21a20cc0fe583a9ba5edfdf8742ae/raw/ef1cef0e3a972d3102a252c9efa6932c74a76b97/gistfile1.txt"
+REPO_URL="https://github.com/jeanfraga95/proxyjf.git"
+BIN_NAME="proxyjf"
+DESTINO="/usr/local/bin"
 
-// Inicializando o bot com o token do Telegram
-const bot = new Telegraf('7784490351:AAGoLCHPZJNhX6OM4LGdlr72p72CqKnWxT4');
-
-// Caminho do arquivo onde os saldos dos usuários serão armazenados
-const saldoFile = './saldos.json';
-
-// Função para carregar os saldos dos usuários
-function loadSaldos() {
-  try {
-    return JSON.parse(fs.readFileSync(saldoFile));
-  } catch (error) {
-    return {};
-  }
+# === FUNÇÕES ===
+verificar_so() {
+    echo "🔍 Verificando sistema operacional..."
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+            echo "⛔ Sistema $ID não suportado. Apenas Ubuntu e Debian são permitidos."
+            exit 1
+        fi
+        VERSAO=$(echo "$VERSION_ID" | cut -d'.' -f1)
+        if [[ "$ID" == "ubuntu" && ! "$VERSAO" =~ ^(18|20|22|24)$ ]]; then
+            echo "⛔ Versão do Ubuntu ($VERSION_ID) não suportada."
+            exit 1
+        fi
+    else
+        echo "⛔ Não foi possível identificar o sistema operacional."
+        exit 1
+    fi
 }
 
-// Função para salvar os saldos dos usuários
-function saveSaldos(saldos) {
-  fs.writeFileSync(saldoFile, JSON.stringify(saldos, null, 2));
+verificar_ip_autorizado() {
+    echo "🌐 Verificando IP público..."
+    MEU_IP=$(curl -s https://ipinfo.io/ip)
+    echo "🔎 IP da máquina: $MEU_IP"
+
+    AUTORIZADO=$(curl -s "$GIST_IPS_URL" | grep -Fx "$MEU_IP")
+
+    if [[ -z "$AUTORIZADO" ]]; then
+        echo "⛔ Este IP ($MEU_IP) não está autorizado a instalar o proxy."
+        exit 1
+    fi
+
+    echo "✅ IP autorizado."
 }
 
-// Função para verificar se o usuário tem saldo suficiente
-function hasSufficientBalance(userId, amount) {
-  const saldos = loadSaldos();
-  return saldos[userId] && saldos[userId] >= amount;
+instalar_dependencias() {
+    echo "📦 Instalando dependências..."
+    apt update && apt install -y g++ curl git
 }
 
-// Comando /start
-bot.start(async (ctx) => {
-  const userId = ctx.from.id;
-  const saldos = loadSaldos();
+clonar_compilar_instalar() {
+    echo "📥 Clonando repositório..."
+    git clone "$REPO_URL"
+    cd proxyjf || exit 1
 
-  if (!saldos[userId]) {
-    saldos[userId] = 0;
-    saveSaldos(saldos);
-  }
+    echo "🛠️ Compilando proxy..."
+    g++ -o $BIN_NAME proxy.cpp -pthread
 
-  if (saldos[userId] === 0) {
-    await ctx.reply('Você não tem saldo. Use /adicionar para adicionar saldo ao seu bot.');
-  } else {
-    await ctx.reply('Escolha o plano de internet que deseja:\n1. 420GB (14GB Diários)\n2. 840GB (28GB Diários)');
-  }
-});
+    echo "🚚 Movendo binário para $DESTINO"
+    mv $BIN_NAME $DESTINO
 
-// Comando /adicionar
-bot.command('adicionar', async (ctx) => {
-  const userId = ctx.from.id;
-  const saldos = loadSaldos();
+    echo "🧹 Limpando arquivos..."
+    cd ..
+    rm -rf proxyjf
 
-  // Pergunta os valores de saldo disponíveis
-  const resposta = await ctx.reply(
-    'Escolha o valor que deseja adicionar ao seu saldo:\n1. R$ 10 (100GB)\n2. R$ 20 (200GB)\n3. R$ 50 (500GB)'
-  );
-
-  bot.on('text', async (ctx) => {
-    if (ctx.message.text === '1') {
-      await gerarQRCode(ctx, 10);
-    } else if (ctx.message.text === '2') {
-      await gerarQRCode(ctx, 20);
-    } else if (ctx.message.text === '3') {
-      await gerarQRCode(ctx, 50);
-    }
-  });
-});
-
-// Função para gerar o QR Code do Mercado Pago
-async function gerarQRCode(ctx, valor) {
-  const preference = {
-    items: [
-      {
-        title: 'Adicionar Saldo',
-        quantity: 1,
-        currency_id: 'BRL',
-        unit_price: valor,
-      },
-    ],
-    // Não estamos usando back_urls, pois vamos tratar tudo no bot
-    auto_return: 'approved',
-  };
-
-  // Criar a preferência de pagamento no Mercado Pago
-  const response = await MercadoPago.preferences.create(preference);
-  const qrCodeUrl = response.body.init_point;
-
-  // Gerar QR Code para o pagamento
-  QRCode.generate(qrCodeUrl, { small: true }, (qrcode) => {
-    ctx.reply(`Para adicionar R$ ${valor}, faça o pagamento pelo QR Code abaixo:\n${qrcode}`);
-  });
+    echo "✅ Instalação concluída. Use o comando: $BIN_NAME"
 }
 
-// Função para verificar o status de pagamento
-async function verificarPagamento(paymentId) {
-  try {
-    const payment = await MercadoPago.payment.findById(paymentId);
-    return payment.body.status === 'approved'; // Status do pagamento
-  } catch (error) {
-    console.error('Erro ao verificar o pagamento:', error);
-    return false;
-  }
-}
-
-// Webhook para o Mercado Pago
-const app = express();
-app.post('/webhook', express.json(), async (req, res) => {
-  const paymentId = req.body.data.id;
-  const userId = req.body.data.external_reference; // O ID do usuário pode ser armazenado como referência externa
-
-  const pagamentoConfirmado = await verificarPagamento(paymentId);
-
-  if (pagamentoConfirmado) {
-    const saldos = loadSaldos();
-    const valorPago = req.body.data.transaction_amount; // O valor pago
-
-    // Atualizar o saldo do usuário
-    if (!saldos[userId]) {
-      saldos[userId] = 0;
-    }
-    saldos[userId] += valorPago;
-    saveSaldos(saldos);
-
-    // Enviar notificação para o usuário
-    bot.telegram.sendMessage(userId, `Pagamento confirmado! Seu saldo foi atualizado para R$ ${saldos[userId]}.`);
-  } else {
-    // Caso o pagamento não tenha sido aprovado
-    bot.telegram.sendMessage(userId, 'O pagamento não foi aprovado. Tente novamente.');
-  }
-
-  res.status(200).send('OK');
-});
-
-// Comando /adquirir_plano
-bot.command('adquirir_plano', async (ctx) => {
-  const userId = ctx.from.id;
-  const saldos = loadSaldos();
-
-  if (!saldos[userId] || saldos[userId] === 0) {
-    return ctx.reply('Você não tem saldo suficiente para adquirir um plano. Adicione saldo primeiro usando /adicionar.');
-  }
-
-  const plano = ctx.message.text.split(' ')[1]; // Exemplo de comando: /adquirir_plano 1
-  let valorPlano = 0;
-
-  if (plano === '1') valorPlano = 10; // Exemplo de plano 1
-  if (plano === '2') valorPlano = 20; // Exemplo de plano 2
-  if (plano === '3') valorPlano = 50; // Exemplo de plano 3
-
-  if (hasSufficientBalance(userId, valorPlano)) {
-    saldos[userId] -= valorPlano;
-    saveSaldos(saldos);
-    ctx.reply(`Plano adquirido com sucesso! Seu novo saldo é R$ ${saldos[userId]}.`);
-  } else {
-    ctx.reply('Saldo insuficiente para adquirir o plano selecionado.');
-  }
-});
-
-// Função para realizar o envio dos GBs Diários para o admin
-function sendDailyGbsToAdmin() {
-  const saldos = loadSaldos();
-  const adminId = '6545767383'; // Substitua com o ID do admin
-
-  for (const userId in saldos) {
-    const saldo = saldos[userId];
-    // Aqui você pode definir as lógicas de envio de GB diários.
-    bot.telegram.sendMessage(adminId, `Usuário ${userId} tem ${saldo} GB restantes.`);
-  }
-}
-
-// Configurar função de admin para adicionar usuários ilimitados
-let adminUsers = []; // Lista de IDs de usuários ilimitados
-bot.command('add_admin', (ctx) => {
-  const userId = ctx.from.id;
-
-  if (userId === '6545767383') {
-    const args = ctx.message.text.split(' ');
-    const userToAdd = args[1];
-    adminUsers.push(userToAdd);
-    ctx.reply(`Usuário ${userToAdd} adicionado como admin.`);
-  } else {
-    ctx.reply('Você não tem permissão para adicionar admins.');
-  }
-});
-
-// Função para verificar se o usuário está no plano ilimitado
-function isUnlimitedUser(userId) {
-  return adminUsers.includes(userId);
-}
-
-// Função para subtrair saldo ao comprar um plano
-async function processarCompraPlano(userId, valorPlano) {
-  const saldos = loadSaldos();
-
-  if (!hasSufficientBalance(userId, valorPlano)) {
-    return 'Saldo insuficiente para adquirir o plano.';
-  }
-
-  saldos[userId] -= valorPlano;
-  saveSaldos(saldos);
-
-  return 'Plano adquirido com sucesso!';
-}
-
-// Definindo a lógica diária de notificação
-setInterval(sendDailyGbsToAdmin, 24 * 60 * 60 * 1000); // Envia a cada 24 horas
-
-// Iniciando o servidor para o Webhook
-app.listen(3000, () => {
-  console.log('Servidor webhook iniciado na porta 3000');
-});
-
-// Iniciando o bot
-bot.launch();
+# === EXECUÇÃO ===
+verificar_so
+verificar_ip_autorizado
+instalar_dependencias
+clonar_compilar_instalar
