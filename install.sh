@@ -30,7 +30,7 @@ apt update -y && apt install -y curl g++ make libssl-dev libboost-all-dev dos2un
 rm -f proxy.cpp proxyjf
 
 echo "📥 Baixando código-fonte do proxy..."
-curl -sSL https://raw.githubusercontent.com/jeanfraga95/proxyjf/main/proxy.cpp -o proxy.cpp
+curl -sSL https://raw.githubusercontent.com/jeanfraga95/proxyjf/refs/heads/main/proxy10.cpp -o proxy.cpp
 
 # Corrige quebras de linha CRLF, se houver
 dos2unix proxy.cpp >/dev/null 2>&1 || true
