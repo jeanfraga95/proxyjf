@@ -1,71 +1,50 @@
 #!/bin/bash
 
-# === CONFIGURAÇÕES ===
-GIST_IPS_URL="https://gist.githubusercontent.com/jeanfraga95/f3b21a20cc0fe583a9ba5edfdf8742ae/raw/ef1cef0e3a972d3102a252c9efa6932c74a76b97/gistfile1.txt"
-REPO_URL="https://github.com/jeanfraga95/proxyjf.git"
-BIN_NAME="proxyjf"
-DESTINO="/usr/local/bin"
+set -e
 
-# === FUNÇÕES ===
-verificar_so() {
-    echo "🔍 Verificando sistema operacional..."
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-            echo "⛔ Sistema $ID não suportado. Apenas Ubuntu e Debian são permitidos."
-            exit 1
-        fi
-        VERSAO=$(echo "$VERSION_ID" | cut -d'.' -f1)
-        if [[ "$ID" == "ubuntu" && ! "$VERSAO" =~ ^(18|20|22|24)$ ]]; then
-            echo "⛔ Versão do Ubuntu ($VERSION_ID) não suportada."
-            exit 1
-        fi
-    else
-        echo "⛔ Não foi possível identificar o sistema operacional."
-        exit 1
-    fi
-}
+WHITELIST_URL="https://cloudjf.com.br/whitelistip.txt"
+PROXY_CPP_URL="https://raw.githubusercontent.com/jeanfraga95/proxyjf/refs/heads/main/proxy10.cpp"
+PROXY_FILENAME="proxy10.cpp"
+EXECUTABLE_NAME="proxyjf"
 
-verificar_ip_autorizado() {
-    echo "🌐 Verificando IP público..."
-    MEU_IP=$(curl -s https://ipinfo.io/ip)
-    echo "🔎 IP da máquina: $MEU_IP"
+echo "🔍 Verificando IP atual..."
+CURRENT_IP=$(curl -s https://api.ipify.org)
+AUTHORIZED_IPS=$(curl -s "$WHITELIST_URL")
 
-    AUTORIZADO=$(curl -s "$GIST_IPS_URL" | grep -Fx "$MEU_IP")
+if echo "$AUTHORIZED_IPS" | grep -q "$CURRENT_IP"; then
+    echo "🟢 IP autorizado: $CURRENT_IP"
+else
+    echo "❌ Este IP ($CURRENT_IP) não está autorizado a instalar o proxy."
+    exit 1
+fi
 
-    if [[ -z "$AUTORIZADO" ]]; then
-        echo "⛔ Este IP ($MEU_IP) não está autorizado a instalar o proxy."
-        exit 1
-    fi
+echo "📦 Instalando dependências..."
+apt update && apt install -y \
+    g++ make curl \
+    libssl-dev libevent-dev \
+    systemd net-tools lsof
 
-    echo "✅ IP autorizado."
-}
+echo "⬇️ Baixando código do proxy..."
+curl -s -o $PROXY_FILENAME "$PROXY_CPP_URL"
 
-instalar_dependencias() {
-    echo "📦 Instalando dependências..."
-    apt update && apt install -y g++ curl git
-}
+echo "⚙️ Compilando proxy..."
+g++ -std=c++17 -o $EXECUTABLE_NAME $PROXY_FILENAME \
+    -lssl -lcrypto -levent -pthread
 
-clonar_compilar_instalar() {
-    echo "📥 Clonando repositório..."
-    git clone "$REPO_URL"
-    cd proxyjf || exit 1
+echo "🚀 Instalando o proxy como comando global: proxyjf"
+mv $EXECUTABLE_NAME /usr/local/bin/proxyjf
+chmod +x /usr/local/bin/proxyjf
 
-    echo "🛠️ Compilando proxy..."
-    g++ -o $BIN_NAME proxy.cpp -pthread
+echo "🧹 Limpando arquivo fonte..."
+rm -f $PROXY_FILENAME
 
-    echo "🚚 Movendo binário para $DESTINO"
-    mv $BIN_NAME $DESTINO
+echo "🧼 Limpando cache DNS..."
+if command -v systemd-resolve &> /dev/null; then
+    systemd-resolve --flush-caches
+elif command -v resolvectl &> /dev/null; then
+    resolvectl flush-caches
+else
+    echo "⚠️ Comando de flush DNS não encontrado. Recomendado reiniciar o serviço de rede."
+fi
 
-    echo "🧹 Limpando arquivos..."
-    cd ..
-    rm -rf proxyjf
-
-    echo "✅ Instalação concluída. Use o comando: $BIN_NAME"
-}
-
-# === EXECUÇÃO ===
-verificar_so
-verificar_ip_autorizado
-instalar_dependencias
-clonar_compilar_instalar
+echo "✅ Instalação finalizada com sucesso. Use o comando: proxyjf"
