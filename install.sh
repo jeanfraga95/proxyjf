@@ -16,11 +16,19 @@ sleep 1
 echo "📦 Instalando dependências..."
 apt update -y && apt install -y git g++ curl make libssl-dev libboost-all-dev dos2unix
 
+# Apagando diretório antigo, se existir
+if [ -d "proxyjf" ]; then
+    echo "⚠️ Diretório 'proxyjf' já existe. Removendo para prosseguir..."
+    rm -rf proxyjf
+fi
+
 # Clonando o repositório
 echo "📥 Baixando o projeto do GitHub..."
-rm -rf proxyjf
 git clone https://github.com/jeanfraga95/proxyjf.git
 cd proxyjf
+
+# Corrigindo possíveis quebras de linha do Windows
+dos2unix proxy.cpp >/dev/null 2>&1 || true
 
 # Compilando o código-fonte
 echo "🔨 Compilando o proxy com suporte a SSL e Threads..."
