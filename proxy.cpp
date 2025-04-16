@@ -67,6 +67,7 @@ void start_proxy(int port) {
         return;
     }
 
+    // Processo filho (daemon)
     umask(0);
     setsid();
     chdir("/");
