@@ -57,8 +57,10 @@ void start_proxy(int port) {
     pid_t pid = fork();
     if (pid < 0) return;
     if (pid > 0) {
-        std::lock_guard<std::mutex> lock(map_mutex);
-        port_pid_map[port] = pid;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex);
+            port_pid_map[port] = pid;
+        }
         std::ofstream f("/tmp/proxy_" + std::to_string(port) + ".pid");
         f << pid;
         f.close();
@@ -97,8 +99,10 @@ void stop_proxy(int port) {
     f >> pid;
     kill(pid, SIGTERM);
     remove(pid_file.c_str());
-    std::lock_guard<std::mutex> lock(map_mutex);
-    port_pid_map.erase(port);
+    {
+        std::lock_guard<std::mutex> lock(map_mutex);
+        port_pid_map.erase(port);
+    }
     std::cout << "🔴 Proxy da porta " << port << " finalizado.\n";
 }
 
