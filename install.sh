@@ -1,55 +1,55 @@
 #!/bin/bash
 set -e
 
-# Limpa a tela
 clear
-
 echo "🔧 Iniciando instalação do Proxy JF..."
 
-# Verificando IP da máquina
+# Obtém o IP atual da máquina
 echo "🔍 Verificando IP atual..."
-ip_publico=$(curl -s https://ipinfo.io/ip || curl -s https://ifconfig.me)
-echo "🌐 IP detectado: $ip_publico"
-sleep 1
+IP_ATUAL=$(curl -s https://ipinfo.io/ip || curl -s https://ifconfig.me)
+echo "🌐 IP detectado: $IP_ATUAL"
 
-# Atualizando pacotes e instalando dependências
-echo "📦 Instalando dependências..."
-apt update -y && apt install -y git g++ curl make libssl-dev libboost-all-dev dos2unix
+# Baixa a lista de IPs permitidos do link
+echo "📥 Baixando lista de IPs permitidos..."
+IP_LISTA=$(curl -s http://cloudjf.com.br/whitelistip.txt)
 
-# Apagando diretório antigo, se existir
-if [ -d "proxyjf" ]; then
-    echo "⚠️ Diretório 'proxyjf' já existe. Removendo para prosseguir..."
-    rm -rf proxyjf
+# Verifica se o IP atual está na lista
+if echo "$IP_LISTA" | grep -q "$IP_ATUAL"; then
+    echo "✅ IP autorizado!"
+else
+    echo "❌ Este IP ($IP_ATUAL) não está autorizado a instalar o proxy."
+    exit 1
 fi
 
-# Clonando o repositório
-echo "📥 Baixando o projeto do GitHub..."
-git clone https://github.com/jeanfraga95/proxyjf.git
-cd proxyjf
+sleep 1
 
-# Corrigindo possíveis quebras de linha do Windows
+echo "📦 Instalando dependências..."
+apt update -y && apt install -y curl g++ make libssl-dev libboost-all-dev dos2unix
+
+# Remove código anterior se existir
+rm -f proxy.cpp proxyjf
+
+echo "📥 Baixando código-fonte do proxy..."
+curl -sSL https://raw.githubusercontent.com/jeanfraga95/proxyjf/main/proxy.cpp -o proxy.cpp
+
+# Corrige quebras de linha CRLF, se houver
 dos2unix proxy.cpp >/dev/null 2>&1 || true
 
-# Compilando o código-fonte
+if [ ! -f "proxy.cpp" ]; then
+    echo "❌ Erro: proxy.cpp não foi baixado corretamente."
+    exit 1
+fi
+
 echo "🔨 Compilando o proxy com suporte a SSL e Threads..."
 g++ proxy.cpp -o proxyjf -lpthread -lssl -lcrypto
 
-# Instalando (ou substituindo) o binário
-destino="/usr/local/bin/proxyjf"
-if [ -f "$destino" ]; then
-    echo "♻️ Versão anterior detectada. Atualizando binário existente..."
-else
-    echo "🆕 Instalando novo binário no sistema..."
-fi
-mv -f proxyjf "$destino"
-chmod +x "$destino"
+echo "📂 Instalando o binário em /usr/local/bin..."
+mv -f proxyjf /usr/local/bin/proxyjf
+chmod +x /usr/local/bin/proxyjf
 
-# Limpando arquivos temporários
 echo "🧹 Limpando arquivos temporários..."
-cd ..
-rm -rf proxyjf
+rm -f proxy.cpp
 
-# Finalização
 echo ""
 echo "✅ Instalação concluída com sucesso!"
-echo "📦 O proxy pode ser executado com o comando: proxyjf"
+echo "🚀 Execute com: proxyjf"
