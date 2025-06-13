@@ -38,17 +38,17 @@ async def save_active_proxies():
     os.makedirs(os.path.dirname(PERSISTENCE_FILE), exist_ok=True)
     with open(PERSISTENCE_FILE, "w") as f:
         json.dump(active_proxies, f, indent=4)
-    logger.info("Active proxies state saved.")
+    logger.info("Estado dos proxies ativos salvo.")
 
 async def load_active_proxies():
     global active_proxies
     if os.path.exists(PERSISTENCE_FILE):
         with open(PERSISTENCE_FILE, "r") as f:
             active_proxies = json.load(f)
-        logger.info("Active proxies state loaded.")
+        logger.info("Os proxies ativos estão carregados.")
     else:
         active_proxies = {}
-        logger.info("No existing active proxies state found.")
+        logger.info("Nenhum estado de proxy ativo existente foi encontrado.")
 
 async def transfer_data(reader, writer, log_prefix):
     try:
