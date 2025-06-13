@@ -395,7 +395,7 @@ async def open_new_port_menu():
         keyfile = os.path.join(cert_dir, f"key_{port}.pem")
 
         if not os.path.exists(certfile) or not os.path.exists(keyfile):
-            logger.info(f"Certificado ou arquivo de chave não encontrado para a porta {porta}. Gerando novos.")
+            logger.info(f"Certificado ou arquivo de chave não encontrado para a porta {port}. Gerando novos.")
             if not await generate_self_signed_cert(certfile, keyfile):
                 logger.error("Falha ao gerar certificado e chave. Abortando a inicialização do proxy WSS.")
                 return
