@@ -205,7 +205,7 @@ async def dispatch_connection(reader, writer):
         # Check if it's an HTTP GET request and if it contains "Upgrade: websocket" header
         if b"GET / HTTP/1.1" in initial_data and b"Upgrade: websocket" in initial_data:
             logger.info(f"[Dispatcher] Detected HTTP/WebSocket signature from {addr}")
-            response = b"HTTP/1.1 101 CloudJF\r\n\r\n"
+            response = b"HTTP/1.1 101 Proxy CloudJF\r\n\r\n"
             writer.write(response)
             await writer.drain()
             logger.info(f"[Dispatcher] Sent custom HTTP 101 CloudJF response to {addr}")
@@ -225,7 +225,7 @@ async def dispatch_connection(reader, writer):
         # Special handling for ports 443 and 8443 (treat as WebSocket)
         elif peer_port in [443, 8443]:
             logger.info(f"[Dispatcher] Connection on special port {peer_port} from {addr}. Treating as WebSocket.")
-            response = b"HTTP/1.1 101 CloudJF\r\n\r\n"
+            response = b"HTTP/1.1 101 Proxy CloudJF\r\n\r\n"
             writer.write(response)
             await writer.drain()
             logger.info(f"[Dispatcher] Sent custom HTTP 101 CloudJF response to {addr} (special port). This will act as a raw tunnel.")
@@ -336,23 +336,23 @@ async def stop_proxy_service(port):
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0:
-        logger.info(f"Service {service_name} stopped and removed successfully.")
+        logger.info(f"Service {service_name} parado e removido com sucesso.")
         if port in active_proxies:
             del active_proxies[port]
         await save_active_proxies() # Save state after modification
         return True
     else:
-        logger.error(f"Failed to stop service {service_name}. Error: {stderr.decode().strip()}")
+        logger.error(f"Falha ao interromper o serviço {service_name}. Error: {stderr.decode().strip()}")
         return False
 
 async def show_menu():
     while True:
-        print("\n--- Network Proxy Server Menu ---")
-        print("1. Open new port")
-        print("2. Close port")
-        print("3. List open ports")
-        print("4. Exit")
-        choice = input("Enter your choice: ")
+        print("\n--- Menu do Proxy CloudJF v1.0 ---")
+        print("1. Abra nova porta")
+        print("2. Fechar porta")
+        print("3. Listar portas abertas")
+        print("4. Sair")
+        choice = input("Digite sua escolha: ")
 
         if choice == "1":
             await open_new_port_menu()
@@ -361,33 +361,33 @@ async def show_menu():
         elif choice == "3":
             await list_open_ports()
         elif choice == "4":
-            logger.info("Exiting menu. Running services will continue in background.")
+            logger.info("Saindo do menu. Os serviços em execução continuarão em segundo plano.")
             break
         else:
-            print("Invalid choice. Please try again.")
+            print("Escolha inválida. Tente novamente.")
 
 async def open_new_port_menu():
-    print("\n--- Open New Port ---")
-    print("Choose protocol:")
+    print("\n--- Abrir nova porta no Proxy CloudJF ---")
+    print("Escolha o protocolo:")
     print("1. WebSocket (WS)")
     print("2. WebSocket Secure (WSS)")
     print("3. SOCKS5")
     # print("4. Multiprotocol (WSS + SOCKS5) - Not yet implemented")
-    protocol_choice = input("Enter protocol choice: ")
+    protocol_choice = input("Insira a escolha do protocolo: ")
 
     try:
-        port = int(input("Enter port number: "))
+        port = int(input("Digite o número da porta: "))
         if not (1 <= port <= 65535):
-            raise ValueError("Port number must be between 1 and 65535.")
+            raise ValueError("O número da porta deve estar entre 1 e 65535.")
     except ValueError as e:
-        logger.error(f"Invalid port number: {e}")
+        logger.error(f"Número de porta inválido: {e}")
         return
 
     certfile = None
     keyfile = None
 
     if protocol_choice == "1": # WS
-        logger.info(f"Opening WS proxy on port {port}...")
+        logger.info(f"Abrindo proxy WS na porta {port}...")
         await start_proxy_service(port, "WS")
     elif protocol_choice == "2": # WSS
         cert_dir = "./network_proxy_server/certs"
@@ -395,54 +395,54 @@ async def open_new_port_menu():
         keyfile = os.path.join(cert_dir, f"key_{port}.pem")
 
         if not os.path.exists(certfile) or not os.path.exists(keyfile):
-            logger.info(f"Certificate or key file not found for port {port}. Generating new ones.")
+            logger.info(f"Certificado ou arquivo de chave não encontrado para a porta {porta}. Gerando novos.")
             if not await generate_self_signed_cert(certfile, keyfile):
-                logger.error("Failed to generate certificate and key. Aborting WSS proxy start.")
+                logger.error("Falha ao gerar certificado e chave. Abortando a inicialização do proxy WSS.")
                 return
         else:
-            logger.info(f"Using existing certificate and key for port {port}.")
+            logger.info(f"Usando certificado e chave existentes para porta {port}.")
 
-        logger.info(f"Opening WSS proxy on port {port}...")
+        logger.info(f"Abrindo proxy WSS na porta {port}...")
         await start_proxy_service(port, "WSS", certfile=certfile, keyfile=keyfile)
     elif protocol_choice == "3": # SOCKS5
-        logger.info(f"Opening SOCKS5 proxy on port {port}...")
+        logger.info(f"Abrindo proxy SOCKS5 na porta {port}...")
         await start_proxy_service(port, "SOCKS5")
     # elif protocol_choice == "4": # Multiprotocol
     #     print("Multiprotocol not yet implemented.")
     else:
-        print("Invalid protocol choice.")
+        print("Escolha de protocolo inválida.")
 
 async def close_port_menu():
-    print("\n--- Close Port ---")
+    print("\n--- Fechar porta ---")
     if not active_proxies:
-        print("No active proxies to close.")
+        print("Nenhum proxy ativo para fechar.")
         return
 
-    print("Active Proxies:")
+    print("Proxies ativos:")
     for port, details in active_proxies.items():
-        print(f"  Port: {port}, Protocol: {details['protocol']}")
+        print(f"  Porta: {port}, Protocolo: {details['protocol']}")
 
     try:
-        port_to_close = int(input("Enter port number to close: "))
+        port_to_close = int(input("Digite o número da porta para fechar: "))
         if port_to_close not in active_proxies:
-            print("Port not found in active proxies.")
+            print("Porta não encontrada em proxies ativos.")
             return
         
         success = await stop_proxy_service(port_to_close)
         if success:
-            logger.info(f"Successfully closed proxy on port {port_to_close}.")
+            logger.info(f"Proxy fechado com sucesso na porta {port_to_close}.")
         else:
-            logger.error(f"Failed to close proxy on port {port_to_close}.")
+            logger.error(f"Falha ao fechar o proxy na porta {port_to_close}.")
 
     except ValueError:
-        logger.error("Invalid port number.")
+        logger.error("Número de porta inválido.")
 
 async def list_open_ports():
-    print("\n--- Open Ports Status ---")
+    print("\n--- Status de portas abertas ---")
     if not active_proxies:
-        print("No proxies currently managed by this session.")
-        print("Note: This only shows proxies started via this menu in the current session.")
-        print("For system-wide status, check `sudo systemctl list-units --type=service | grep proxyport`")
+        print("Nenhum proxy é gerenciado atualmente por esta sessão.")
+        print("Nota: Isso mostra apenas os proxies iniciados por meio deste menu na sessão atual.")
+        print("Para o status de todo o sistema, verifique `sudo systemctl list-units --type=service | grep proxyport`")
         return
 
     print("Proxies managed by this session:")
