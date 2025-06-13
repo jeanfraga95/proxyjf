@@ -33,10 +33,9 @@ check_os_compatibility() {
 # Instala dependências necessárias
 install_dependencies() {
     echo "Instalando dependências..."
-    sudo apt update
     sudo apt install -y python3 python3-pip openssl git
-    pip3 install --upgrade pip
-    pip3 install websockets
+    python3 -m pip install --upgrade pip
+    python3 -m pip install websockets
     echo "Dependências instaladas."
 }
 
