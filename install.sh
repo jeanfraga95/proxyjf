@@ -35,6 +35,7 @@ install_dependencies() {
     echo "Instalando dependências..."
     sudo apt update
     sudo apt install -y python3 python3-pip openssl git
+    pip3 install --upgrade pip
     pip3 install websockets
     echo "Dependências instaladas."
 }
@@ -56,9 +57,10 @@ setup_proxyjf_command() {
     SCRIPT_PATH="$INSTALL_DIR/network_proxy_server/proxy_server.py"
     COMMAND_PATH="/usr/local/bin/proxyjf"
 
-    echo "#!/bin/bash" | sudo tee "$COMMAND_PATH" > /dev/null
-    echo "python3 $SCRIPT_PATH" | sudo tee -a "$COMMAND_PATH" > /dev/null
+    sudo bash -c "echo '#!/bin/bash' > $COMMAND_PATH"
+    sudo bash -c "echo 'python3 $SCRIPT_PATH' >> $COMMAND_PATH"
     sudo chmod +x "$COMMAND_PATH"
+
     echo "Comando proxyjf configurado. Agora você pode executar 'sudo proxyjf' para abrir o menu do proxy."
 }
 
