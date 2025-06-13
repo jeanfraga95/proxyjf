@@ -4,7 +4,6 @@ set -e
 
 INSTALL_DIR="/opt/proxyjf"
 REPO_URL="https://github.com/jeanfraga95/proxyjf.git"
-PROXY_FILES_PATH="arquivos-proxy"
 
 # Function to check OS compatibility
 check_os_compatibility() {
@@ -47,9 +46,7 @@ download_proxy_files() {
         sudo rm -rf "$INSTALL_DIR"
     fi
     sudo git clone "$REPO_URL" "$INSTALL_DIR"
-    sudo mv "$INSTALL_DIR/$PROXY_FILES_PATH"/* "$INSTALL_DIR"/
-    sudo rm -rf "$INSTALL_DIR/$PROXY_FILES_PATH"
-    echo "Proxy files downloaded and moved to $INSTALL_DIR."
+    echo "Proxy files downloaded to $INSTALL_DIR."
 }
 
 # Function to set up proxyjf command
@@ -75,5 +72,3 @@ main() {
 }
 
 main
-
-
