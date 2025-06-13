@@ -5,7 +5,7 @@ set -e
 INSTALL_DIR="/opt/proxyjf"
 REPO_URL="https://github.com/jeanfraga95/proxyjf.git"
 
-# Function to check OS compatibility
+# Verifica compatibilidade do sistema operacional
 check_os_compatibility() {
     echo "Verificando compatibilidade do sistema operacional..."
     if [ -f /etc/os-release ]; then
@@ -30,45 +30,45 @@ check_os_compatibility() {
     fi
 }
 
-# Function to install dependencies
+# Instala dependências necessárias
 install_dependencies() {
     echo "Instalando dependências..."
+    sudo apt update
     sudo apt install -y python3 python3-pip openssl git
     pip3 install websockets
     echo "Dependências instaladas."
 }
 
-# Function to download proxy files
+# Baixa os arquivos do proxy
 download_proxy_files() {
     echo "Baixando arquivos do proxy..."
     if [ -d "$INSTALL_DIR" ]; then
-        echo "Instalação de proxy existente encontrada. Atualizando..."
+        echo "Instalação existente encontrada. Atualizando..."
         sudo rm -rf "$INSTALL_DIR"
     fi
     sudo git clone "$REPO_URL" "$INSTALL_DIR"
-    echo "Proxy files downloaded to $INSTALL_DIR."
+    echo "Arquivos do proxy baixados para $INSTALL_DIR."
 }
 
-# Function to set up proxyjf command
+# Configura o comando global proxyjf
 setup_proxyjf_command() {
     echo "Configurando o proxyjf..."
     SCRIPT_PATH="$INSTALL_DIR/network_proxy_server/proxy_server.py"
     COMMAND_PATH="/usr/local/bin/proxyjf"
 
-    # Create a wrapper script to run the Python application
-    echo "#!/bin/bash" | sudo tee "$COMMAND_PATH"
-    echo "python3 $SCRIPT_PATH" | sudo tee -a "$COMMAND_PATH"
+    echo "#!/bin/bash" | sudo tee "$COMMAND_PATH" > /dev/null
+    echo "python3 $SCRIPT_PATH" | sudo tee -a "$COMMAND_PATH" > /dev/null
     sudo chmod +x "$COMMAND_PATH"
     echo "Comando proxyjf configurado. Agora você pode executar 'sudo proxyjf' para abrir o menu do proxy."
 }
 
-# Main installation process
+# Processo principal de instalação
 main() {
     check_os_compatibility
     install_dependencies
     download_proxy_files
     setup_proxyjf_command
-    echo "Instalação concluída!"
+    echo "Instalação concluída com sucesso!"
 }
 
 main
