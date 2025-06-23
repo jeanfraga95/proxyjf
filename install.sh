@@ -559,7 +559,7 @@ show_usage_instructions() {
     echo -e "   ${BLUE}sudo proxyjf${NC}"
     echo
     echo -e "${YELLOW}2. Menu interativo disponível com opções:${NC}"
-    echo -e "   • 1 echo -e "   • 1️⃣  Abrir nova porta (multiprotocolo)"
+    echo -e "   • 1 echo -e   • 1️⃣  Abrir nova porta (multiprotocolo)"
     echo -e "   • 2️⃣  Fechar porta"
     echo -e "   • 3️⃣  Listar portas ativas"
     echo -e "   • 4️⃣  Status do sistema"
