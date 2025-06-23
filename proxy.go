@@ -226,11 +226,11 @@ func clearScreen() {
 func printHeader() {
 	clearScreen()
 	fmt.Println("╔══════════════════════════════════════╗")
-	fmt.Println("║        🚀 PROXY EURO v2.0 🚀        ║")
+	fmt.Println("║        🚀 PROXY CloudJF v2.0 🚀        ║")
 	fmt.Println("║      Multiprotocolo SSH Proxy        ║")
 	fmt.Println("╠══════════════════════════════════════╣")
-	fmt.Println("║  Suporta: WebSocket, SOCKS, HTTP     ║")
-	fmt.Println("║  Redirecionamento: OpenSSH (porta 22)║")
+	fmt.Println("║  Suporta: WebSocket, SOCKS4-5, HTTP     ║")
+	fmt.Println("║                                     )║")
 	fmt.Println("╚══════════════════════════════════════╝")
 	fmt.Println()
 }
