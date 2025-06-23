@@ -1,4 +1,6 @@
+Aqui está a versão corrigida do instalador, que agora verifica se o Proxy JF já está instalado e, se estiver, substitui a instalação existente. Além disso, a verificação de conectividade com a internet foi removida, conforme solicitado.
 
+```bash
 #!/bin/bash
 
 # ============================================================================
@@ -127,7 +129,7 @@ check_ubuntu_version() {
 check_existing_installation() {
     print_step "Verificando instalação existente do Proxy JF..."
     
-    if [[ -f "$INSTALL_DIR/proxyjf" ]]; then
+    if [[ -d "$INSTALL_DIR" ]]; then
         print_info "Proxy JF já está instalado. Atualizando..."
         rm -rf "$INSTALL_DIR"  # Remove a instalação anterior
     fi
@@ -559,7 +561,7 @@ show_usage_instructions() {
     echo -e "   ${BLUE}sudo proxyjf${NC}"
     echo
     echo -e "${YELLOW}2. Menu interativo disponível com opções:${NC}"
-    echo -e "   • 1 echo -e   • 1️⃣  Abrir nova porta (multiprotocolo)"
+    echo -e "   • 1️⃣  Abrir nova porta (multiprotoc ocolos)"
     echo -e "   • 2️⃣  Fechar porta"
     echo -e "   • 3️⃣  Listar portas ativas"
     echo -e "   • 4️⃣  Status do sistema"
