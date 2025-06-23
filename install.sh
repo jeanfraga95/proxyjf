@@ -1,10 +1,13 @@
+Claro! Abaixo está a versão atualizada do instalador que verifica se o Proxy JF já está instalado. Se estiver, ele irá substituir a instalação existente, como se estivesse atualizando. Além disso, a verificação de conectividade com a internet foi removida, conforme solicitado.
+
+```bash
 #!/bin/bash
 
 # ============================================================================
 # INSTALADOR DO PROXY JF - MULTIPROTOCOLO SSH PROXY
 # ============================================================================
 # Autor: Jean Fraga
-# Repositório: https://github.com/jeanfraga95
+# Repositório: https://github.com/jeanfraga95/proxyjf
 # Suporte: Ubuntu 18.04, 20.04, 22.04, 24.04
 # Versão: 1.1
 # Data: $(date '+%Y-%m-%d')
@@ -558,4 +561,155 @@ show_usage_instructions() {
     echo -e "   ${BLUE}sudo proxyjf${NC}"
     echo
     echo -e "${YELLOW}2. Menu interativo disponível com opções:${NC}"
-    echo -e "   • 1
+    echo -e "   • 1 echo -e "   • 1️⃣  Abrir nova porta (multiprotocolo)"
+    echo -e "   • 2️⃣  Fechar porta"
+    echo -e "   • 3️⃣  Listar portas ativas"
+    echo -e "   • 4️⃣  Status do sistema"
+    echo -e "   • 5️⃣  Ver logs em tempo real"
+    echo -e "   • 0️⃣  Sair (mantém proxies ativos)"
+    echo
+    echo -e "${YELLOW}3. Gerenciar via systemctl:${NC}"
+    echo -e "   ${BLUE}systemctl status proxyws@PORTA${NC}    # Ver status"
+    echo -e "   ${BLUE}systemctl stop proxyws@PORTA${NC}      # Parar porta"
+    echo -e "   ${BLUE}systemctl start proxyws@PORTA${NC}     # Iniciar porta"
+    echo
+    echo -e "${YELLOW}4. Monitorar logs:${NC}"
+    echo -e "   ${BLUE}tail -f /var/log/proxyws.log${NC}      # Logs do proxy"
+    echo -e "   ${BLUE}tail -f /var/log/proxyjf_install.log${NC} # Logs da instalação"
+    echo
+    echo -e "${YELLOW}5. Desinstalar completamente:${NC}"
+    echo -e "   ${BLUE}sudo $INSTALL_DIR/uninstall.sh${NC}"
+    echo
+    echo -e "${CYAN}🔧 PROTOCOLOS SUPORTADOS (AUTOMÁTICO):${NC}"
+    echo -e "   • ${GREEN}WebSocket Security${NC} → HTTP/1.1 101 ProxyEuro + Headers WS"
+    echo -e "   • ${GREEN}SOCKS4/SOCKS5${NC}      → HTTP/1.1 200 OK"
+    echo -e "   • ${GREEN}HTTP/HTTPS${NC}         → HTTP/1.1 101 ProxyEuro"
+    echo -e "   • ${GREEN}TCP Genérico${NC}       → HTTP/1.1 101 ProxyEuro"
+    echo
+    echo -e "${CYAN}📍 ARQUIVOS IMPORTANTES:${NC}"
+    echo -e "   • Binário: ${BLUE}$INSTALL_DIR/proxyjf${NC}"
+    echo -e "   • Comando: ${BLUE}proxyjf${NC} (disponível globalmente)"
+    echo -e "   • Logs: ${BLUE}/var/log/proxyws.log${NC}"
+    echo -e "   • Desinstalador: ${BLUE}$INSTALL_DIR/uninstall.sh${NC}"
+    echo
+    echo -e "${CYAN}🎯 EXEMPLO DE USO RÁPIDO:${NC}"
+    echo -e "   ${BLUE}sudo proxyjf${NC}                    # Iniciar menu"
+    echo -e "   ${BLUE}# Escolher opção 1 e digitar 8080${NC}  # Abrir porta"
+    echo -e "   ${BLUE}# Testar: curl --socks5 IP:8080 httpbin.org/ip${NC}"
+    echo
+    echo -e "${GREEN}✅ Proxy JF instalado e pronto para uso!${NC}"
+    echo -e "${GREEN}🚀 Todos os protocolos redirecionam para SSH (porta 22)${NC}"
+    echo
+}
+
+# ============================================================================
+# FUNÇÕES PRINCIPAIS DE EXECUÇÃO
+# ============================================================================
+
+run_system_checks() {
+    print_step "Iniciando verificações do sistema..."
+    
+    check_root
+    check_ubuntu_version
+    check_existing_installation
+    check_architecture
+    
+    print_success "Todas as verificações do sistema passaram ✓"
+    echo
+}
+
+run_dependency_installation() {
+    print_step "Iniciando instalação de dependências..."
+    
+    update_system
+    install_basic_packages
+    install_golang
+    verify_installations
+    
+    print_success "Todas as dependências instaladas ✓"
+    echo
+}
+
+run_download_and_compilation() {
+    print_step "Iniciando download e compilação..."
+    
+    download_repository
+    compile_proxy
+    configure_permissions
+    
+    print_success "Download e compilação concluídos ✓"
+    echo
+}
+
+run_system_configuration() {
+    print_step "Iniciando configuração do sistema..."
+    
+    create_directories
+    configure_logging
+    configure_systemd
+    test_installation
+    
+    print_success "Configuração do sistema concluída ✓"
+    echo
+}
+
+run_finalization() {
+    print_step "Finalizando instalação..."
+    
+    create_uninstaller
+    show_usage_instructions
+    
+    log_message "=== INSTALAÇÃO DO PROXY JF CONCLUÍDA COM SUCESSO ==="
+    print_success "Instalação finalizada com sucesso! ✓"
+}
+
+# ============================================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================================
+
+main() {
+    # Mostrar banner
+    print_banner
+    
+    # Criar arquivo de log
+    touch "$LOG_FILE" 2>/dev/null || {
+        echo "Erro: Não foi possível criar arquivo de log. Execute como root."
+        exit 1
+    }
+    
+    log_message "=== INÍCIO DA INSTALAÇÃO DO PROXY JF ==="
+    log_message "Sistema: $(uname -a)"
+    log_message "Usuário: $(whoami)"
+    log_message "Data: $(date)"
+    
+    print_info "🚀 Iniciando instalação do Proxy JF..."
+    print_info "📝 Log da instalação: $LOG_FILE"
+    print_info "🔗 Repositório: $REPO_URL"
+    echo
+    
+    # Executar todas as etapas
+    run_system_checks
+    run_dependency_installation
+    run_download_and_compilation
+    run_system_configuration
+    run_finalization
+    
+    # Log final
+    log_message "Instalação concluída com sucesso em $(date)"
+    log_message "Sistema: Ubuntu $UBUNTU_VERSION ($ARCH)"
+    log_message "Go: $GO_VERSION"
+    log_message "Proxy instalado em: $INSTALL_DIR"
+}
+
+# ============================================================================
+# EXECUÇÃO PRINCIPAL
+# ============================================================================
+
+# Verificar se está sendo executado diretamente
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+
+# ============================================================================
+# FIM DO INSTALADOR
+# ==========================================================================
