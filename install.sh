@@ -1,6 +1,4 @@
-Claro! Abaixo está a versão atualizada do instalador que verifica se o Proxy JF já está instalado. Se estiver, ele irá substituir a instalação existente, como se estivesse atualizando. Além disso, a verificação de conectividade com a internet foi removida, conforme solicitado.
 
-```bash
 #!/bin/bash
 
 # ============================================================================
