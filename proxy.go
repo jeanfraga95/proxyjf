@@ -35,14 +35,12 @@ func logMessage(msg string) {
 	defer logMutex.Unlock()
 	f, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("Erro ao escrever no log: %v
-", err)
+		log.Printf("Erro ao escrever no log: %v\n", err) // Corrigido: \n explícito
 		return
 	}
 	defer f.Close()
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Fprintf(f, "[%s] %s
-", timestamp, msg)
+	fmt.Fprintf(f, "[%s] %s\n", timestamp, msg) // Corrigido: \n explícito
 }
 
 // Detecta o tipo de protocolo baseado nos dados iniciais
@@ -108,32 +106,22 @@ func handleConnection(conn net.Conn) {
 	switch protocol {
 	case "socks5", "socks4":
 		// Resposta específica para SOCKS
-		resp = "HTTP/1.1 200 OK
-
-"
+		resp = "HTTP/1.1 200 OK\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão SOCKS estabelecida")
 		
 	case "websocket":
 		// Resposta para WebSocket Security
-		resp = "HTTP/1.1 101 ProxyEuro
-Upgrade: websocket
-Connection: Upgrade
-
-"
+		resp = "HTTP/1.1 101 ProxyEuro\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão WebSocket Security estabelecida")
 		
 	case "http":
 		// Resposta para HTTP/HTTPS
-		resp = "HTTP/1.1 101 ProxyEuro
-
-"
+		resp = "HTTP/1.1 101 ProxyEuro\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão HTTP estabelecida")
 		
 	default:
 		// TCP simples
-		resp = "HTTP/1.1 101 ProxyEuro
-
-"
+		resp = "HTTP/1.1 101 ProxyEuro\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão TCP estabelecida")
 	}
 	
@@ -258,8 +246,7 @@ func printMenu() {
 	fmt.Println("│  5️⃣  - Ver logs                     │")
 	fmt.Println("│  0️⃣  - Sair                         │")
 	fmt.Println("└─────────────────────────────────────┘")
-	fmt.Print("
-🔸 Escolha uma opção: ")
+	fmt.Print("\n🔸 Escolha uma opção: ") // Corrigido: \n explícito
 }
 
 func listActivePorts() {
@@ -281,8 +268,7 @@ func listActivePorts() {
 		fmt.Println(string(output))
 	}
 	
-	fmt.Print("
-📌 Pressione Enter para continuar...")
+	fmt.Print("\n📌 Pressione Enter para continuar...") // Corrigido: \n explícito
 }
 
 func showSystemStatus() {
@@ -306,10 +292,8 @@ func showSystemStatus() {
 	cmd = exec.Command("ss", "-tlnp")
 	output, err := cmd.Output()
 	if err == nil {
-		fmt.Println("
-🔌 Portas em uso:")
-		lines := strings.Split(string(output), "
-")
+		fmt.Println("\n🔌 Portas em uso:") // Corrigido: \n explícito
+		lines := strings.Split(string(output), "\n") // Corrigido: \n explícito
 		for _, line := range lines {
 			if strings.Contains(line, ":22 ") {
 				fmt.Println("   📍 SSH (22): Ativo")
@@ -318,8 +302,7 @@ func showSystemStatus() {
 		}
 	}
 	
-	fmt.Print("
-📌 Pressione Enter para continuar...")
+	fmt.Print("\n📌 Pressione Enter para continuar...") // Corrigido: \n explícito
 }
 
 func showLogs() {
@@ -336,8 +319,7 @@ func showLogs() {
 		fmt.Println(string(output))
 	}
 	
-	fmt.Print("
-📌 Pressione Enter para continuar...")
+	fmt.Print("\n📌 Pressione Enter para continuar...") // Corrigido: \n explícito
 }
 
 func waitForEnter() {
@@ -349,8 +331,7 @@ func main() {
 	if len(os.Args) > 1 {
 		port, err := strconv.Atoi(os.Args[1])
 		if err != nil {
-			fmt.Printf("❌ Parâmetro inválido: %s
-", os.Args[1])
+			fmt.Printf("❌ Parâmetro inválido: %s\n", os.Args[1]) // Corrigido: \n explícito
 			return
 		}
 		
@@ -404,27 +385,23 @@ func main() {
 			
 			clearScreen()
 			printHeader()
-			fmt.Printf("⚙️  Configurando porta %d...
-", port)
+			fmt.Printf("⚙️  Configurando porta %d...\n", port) // Corrigido: \n explícito
 			
 			if err := createSystemdService(port, execPath); err != nil {
-				fmt.Printf("❌ Erro criando service: %v
-", err)
+				fmt.Printf("❌ Erro criando service: %v\n", err) // Corrigido: \n explícito
 				fmt.Print("📌 Pressione Enter para continuar...")
 				waitForEnter()
 				continue
 			}
 			
 			if err := enableAndStartService(port); err != nil {
-				fmt.Printf("❌ Erro iniciando service: %v
-", err)
+				fmt.Printf("❌ Erro iniciando service: %v\n", err) // Corrigido: \n explícito
 				fmt.Print("📌 Pressione Enter para continuar...")
 				waitForEnter()
 				continue
 			}
 			
-			fmt.Printf("✅ Proxy multiprotocolo iniciado na porta %d
-", port)
+			fmt.Printf("✅ Proxy multiprotocolo iniciado na porta %d\n", port) // Corrigido: \n explícito
 			fmt.Println("🔹 Protocolos suportados: WebSocket, SOCKS4/5, HTTP")
 			fmt.Println("🔹 Redirecionamento: OpenSSH (porta 22)")
 			fmt.Print("📌 Pressione Enter para continuar...")
@@ -462,11 +439,9 @@ func main() {
 			
 			if conf == "s" || conf == "sim" {
 				if err := stopAndDisableService(port); err != nil {
-					fmt.Printf("❌ Erro ao parar service: %v
-", err)
+					fmt.Printf("❌ Erro ao parar service: %v\n", err) // Corrigido: \n explícito
 				} else {
-					fmt.Printf("✅ Porta %d encerrada com sucesso
-", port)
+					fmt.Printf("✅ Porta %d encerrada com sucesso\n", port) // Corrigido: \n explícito
 				}
 			} else {
 				fmt.Println("❌ Operação cancelada")
