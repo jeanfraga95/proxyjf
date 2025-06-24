@@ -57,10 +57,11 @@ remove_proxy() {
     systemctl disable proxy.service 2>/dev/null
     rm -rf "$INSTALL_DIR"
     rm -f /etc/systemd/system/proxy.service
+    rm -rf /usr/local/bin/proxyjf
     systemctl daemon-reexec
     echo -e "${GREEN}✔ Proxy removido com sucesso.${NC}"
   else
-    echo -e "${RED}⚠ Nenhum proxy instalado encontrado.${NC}"
+    echo -e "${RED}⚠ Nenhum proxy instalado encontrado para ser removido. ${NC}"
   fi
 }
 
@@ -74,7 +75,6 @@ install_dependencies() {
   if [ "${#MISSING[@]}" -gt 0 ]; then
     echo -e "${YELLOW}Instalando dependências...${NC}"
     progress_bar
-    apt-get update -qq
     apt-get install -y "${MISSING[@]}" > /dev/null
   else
     echo -e "${GREEN}✔ Todas as dependências já estão instaladas.${NC}"
