@@ -62,22 +62,57 @@ func detectProtocol(data []byte) string {
 	}
 	
 	// Detecta WebSocket
-	if strings.Contains(dataStr, "upgrade: websocket") {
-		return "websocket"
-	}
+	if (
+	strings.HasPrefix(dataStr, "GET ") ||
+	strings.HasPrefix(dataStr, "POST ") ||
+	strings.HasPrefix(dataStr, "PUT ") ||
+	strings.HasPrefix(dataStr, "DELETE ") ||
+	strings.HasPrefix(dataStr, "OPTIONS ") ||
+	strings.HasPrefix(dataStr, "HEAD ") ||
+	strings.HasPrefix(dataStr, "CONNECT ") ||
+	strings.HasPrefix(dataStr, "PATCH ") ||
+	strings.HasPrefix(dataStr, "TRACE ") ||
+	strings.HasPrefix(dataStr, "PROPFIND ") ||
+	strings.HasPrefix(dataStr, "PROPPATCH ") ||
+	strings.HasPrefix(dataStr, "MKCOL ") ||
+	strings.HasPrefix(dataStr, "COPY ") ||
+	strings.HasPrefix(dataStr, "MOVE ") ||
+	strings.HasPrefix(dataStr, "LOCK ") ||
+	strings.HasPrefix(dataStr, "UNLOCK ") ||
+	strings.HasPrefix(dataStr, "SEARCH ")
+) && (
+	strings.Contains(dataStrLower, "upgrade: websocket") ||
+	strings.Contains(dataStrLower, "connection: keep-alive") ||
+	strings.Contains(dataStrLower, "connection: websocket")
+) {
+	return "websocket"
+}
+
+}
 	
 	// Detecta HTTP/HTTPS
-	if strings.HasPrefix(dataStr, "get ") || 
-	   strings.HasPrefix(dataStr, "post ") ||
-	   strings.HasPrefix(dataStr, "put ") ||
-	   strings.HasPrefix(dataStr, "delete ") ||
-	   strings.HasPrefix(dataStr, "options ") ||
-	   strings.HasPrefix(dataStr, "head ") ||
-	   strings.HasPrefix(dataStr, "connect ") {
-		return "http"
-	}
+	if strings.HasPrefix(dataStr, "GET ") || 
+   strings.HasPrefix(dataStr, "POST ") ||
+   strings.HasPrefix(dataStr, "PUT ") ||
+   strings.HasPrefix(dataStr, "DELETE ") ||
+   strings.HasPrefix(dataStr, "OPTIONS ") ||
+   strings.HasPrefix(dataStr, "HEAD ") ||
+   strings.HasPrefix(dataStr, "CONNECT ") ||
+   strings.HasPrefix(dataStr, "PATCH ") ||
+   strings.HasPrefix(dataStr, "TRACE ") ||
+   strings.HasPrefix(dataStr, "PROPFIND ") ||
+   strings.HasPrefix(dataStr, "PROPPATCH ") ||
+   strings.HasPrefix(dataStr, "MKCOL ") ||
+   strings.HasPrefix(dataStr, "COPY ") ||
+   strings.HasPrefix(dataStr, "MOVE ") ||
+   strings.HasPrefix(dataStr, "LOCK ") ||
+   strings.HasPrefix(dataStr, "UNLOCK ") ||
+   strings.HasPrefix(dataStr, "SEARCH ") {
+	return "websocket"
+}
+
 	
-	return "tcp"
+	return "websocket"
 }
 
 // Função principal para lidar com conexões multiprotocolo
@@ -111,17 +146,17 @@ func handleConnection(conn net.Conn) {
 		
 	case "websocket":
 		// Resposta para WebSocket Security
-		resp = "HTTP/1.1 101 ProxyEuro\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" // Corrigido: \r\n explícito
+		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão WebSocket Security estabelecida")
 		
 	case "http":
 		// Resposta para HTTP/HTTPS
-		resp = "HTTP/1.1 101 ProxyEuro\r\n\r\n" // Corrigido: \r\n explícito
+		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão HTTP estabelecida")
 		
 	default:
 		// TCP simples
-		resp = "HTTP/1.1 101 ProxyEuro\r\n\r\n" // Corrigido: \r\n explícito
+		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n" // Corrigido: \r\n explícito
 		logMessage("Conexão TCP estabelecida")
 	}
 	
@@ -212,12 +247,28 @@ func enableAndStartService(port int) error {
 
 func stopAndDisableService(port int) error {
 	serviceName := fmt.Sprintf("proxyws@%d.service", port)
-	cmd := exec.Command("systemctl", "stop", serviceName)
-	_ = cmd.Run()
-	cmd = exec.Command("systemctl", "disable", serviceName)
-	_ = cmd.Run()
-	return os.Remove(systemdServicePath(port))
+
+	// Parar o serviço
+	if err := exec.Command("systemctl", "stop", serviceName).Run(); err != nil {
+		return fmt.Errorf("falha ao parar o serviço %s: %w", serviceName, err)
+	}
+	fmt.Printf("✅ Serviço %s parado com sucesso.\n", serviceName)
+
+	// Desabilitar o serviço
+	if err := exec.Command("systemctl", "disable", serviceName).Run(); err != nil {
+		return fmt.Errorf("falha ao desabilitar o serviço %s: %w", serviceName, err)
+	}
+	fmt.Printf("✅ Serviço %s desabilitado com sucesso.\n", serviceName)
+
+	// Remover o arquivo do serviço
+	if err := os.Remove(systemdServicePath(port)); err != nil {
+		return fmt.Errorf("falha ao remover o arquivo do serviço: %w", err)
+	}
+	fmt.Printf("🗑️ Arquivo do serviço %s removido com sucesso.\n", serviceName)
+
+	return nil
 }
+
 
 func clearScreen() {
 	fmt.Print("\033[H\033[2J")
@@ -226,10 +277,10 @@ func clearScreen() {
 func printHeader() {
 	clearScreen()
 	fmt.Println("╔══════════════════════════════════════╗")
-	fmt.Println("║        🚀 PROXY CloudJF v2.0 🚀        ║")
+	fmt.Println("║        🚀 PROXY CloudJF v2.1 🚀        ║")
 	fmt.Println("║      Multiprotocolo SSH Proxy        ║")
 	fmt.Println("╠══════════════════════════════════════╣")
-	fmt.Println("║  Suporta: WebSocket, SOCKS4-5, HTTP     ║")
+	fmt.Println("║  Suporta: WebSocket, SOCKS4-5        ║")
 	fmt.Println("║                                     )║")
 	fmt.Println("╚══════════════════════════════════════╝")
 	fmt.Println()
@@ -402,8 +453,8 @@ func main() {
 			}
 			
 			fmt.Printf("✅ Proxy multiprotocolo iniciado na porta %d\n", port) // Corrigido: \n explícito
-			fmt.Println("🔹 Protocolos suportados: WebSocket, SOCKS4/5, HTTP")
-			fmt.Println("🔹 Redirecionamento: OpenSSH (porta 22)")
+			fmt.Println("🔹 Protocolos suportados: WebSocket, SOCKS4/5")
+			fmt.Println("🔹 Não Funciona com OpenVPN")
 			fmt.Print("📌 Pressione Enter para continuar...")
 			waitForEnter()
 
