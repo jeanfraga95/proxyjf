@@ -11,9 +11,9 @@ NC="\033[0m"
 INSTALL_DIR="/opt/proxyapp"
 BIN_NAME="proxy"
 GO_FILE="proxy.go"
-DEPS=(curl wget unzip git g++ make libevent-dev golang)
+DEPS=(curl wget unzip git g++ make libevent-dev)
 
-# === FUNÇÃO: Barra de progresso falsa ===
+# === BARRA DE PROGRESSO ===
 progress_bar() {
   echo -ne "${BLUE}"
   for i in {1..20}; do
@@ -23,7 +23,7 @@ progress_bar() {
   echo -e "${NC}"
 }
 
-# === FUNÇÃO: Verifica sistema ===
+# === VERIFICA SE É UBUNTU ===
 check_system() {
   if ! grep -qi "ubuntu" /etc/os-release; then
     echo -e "${RED}❌ Este script só funciona em sistemas Ubuntu.${NC}"
@@ -31,7 +31,7 @@ check_system() {
   fi
 }
 
-# === FUNÇÃO: Menu ===
+# === MENU ===
 user_choice() {
   echo -e "${YELLOW}O que deseja fazer?${NC}"
   select opt in "Instalar/Atualizar Proxy" "Remover Proxy" "Sair"; do
@@ -44,7 +44,7 @@ user_choice() {
   done
 }
 
-# === FUNÇÃO: Remover Proxy ===
+# === REMOVE PROXY ===
 remove_proxy() {
   echo -e "${YELLOW}Removendo proxy...${NC}"
   progress_bar
@@ -61,7 +61,7 @@ remove_proxy() {
   fi
 }
 
-# === FUNÇÃO: Instalar Dependências ===
+# === INSTALA DEPENDÊNCIAS PADRÃO ===
 install_dependencies() {
   MISSING=()
   for pkg in "${DEPS[@]}"; do
@@ -78,7 +78,35 @@ install_dependencies() {
   fi
 }
 
-# === FUNÇÃO: Compilar Proxy ===
+# === VERIFICA E INSTALA O GO SE NECESSÁRIO ===
+ensure_go() {
+  REQUIRED_VERSION="1.16"
+
+  CURRENT_GO=$(go version 2>/dev/null)
+  if [[ $? -eq 0 ]]; then
+    CURRENT_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+    if dpkg --compare-versions "$CURRENT_VERSION" "ge" "$REQUIRED_VERSION"; then
+      echo -e "${GREEN}✔ Go $CURRENT_VERSION detectado.${NC}"
+      return
+    else
+      echo -e "${YELLOW}⚠ Versão do Go ($CURRENT_VERSION) é antiga. Atualizando...${NC}"
+    fi
+  else
+    echo -e "${YELLOW}⚠ Go não está instalado. Instalando...${NC}"
+  fi
+
+  # Instalar Go manualmente
+  cd /tmp
+  wget -q https://go.dev/dl/go1.22.3.linux-amd64.tar.gz
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf go1.22.3.linux-amd64.tar.gz
+  export PATH=$PATH:/usr/local/go/bin
+  echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+
+  echo -e "${GREEN}✔ Go 1.22.3 instalado com sucesso.${NC}"
+}
+
+# === COMPILA O PROXY ===
 build_proxy() {
   echo -e "${YELLOW}Compilando proxy...${NC}"
   progress_bar
@@ -89,7 +117,7 @@ build_proxy() {
   fi
 }
 
-# === FUNÇÃO: Instalar Proxy ===
+# === INSTALA O PROXY ===
 install_proxy() {
   build_proxy
 
@@ -123,7 +151,7 @@ EOF
   echo -e "${BLUE}▶ Para iniciar manualmente: ${INSTALL_DIR}/${BIN_NAME}${NC}"
 }
 
-# === EXECUÇÃO ===
+# === EXECUÇÃO PRINCIPAL ===
 check_system
 user_choice
 
@@ -131,5 +159,6 @@ if [ "$ACTION" = "remove" ]; then
   remove_proxy
 else
   install_dependencies
+  ensure_go
   install_proxy
 fi
