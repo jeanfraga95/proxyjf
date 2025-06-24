@@ -150,12 +150,15 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
+ systemctl daemon-reload
   systemctl enable proxy.service
   systemctl start proxy.service
 
+  # Cria link simbólico para acesso global
+  ln -sf "$INSTALL_DIR/$BIN_NAME" /usr/local/bin/proxyjf
+
   echo -e "${GREEN}✅ Instalação concluída com sucesso!${NC}"
-  echo -e "${BLUE}▶ Para iniciar manualmente: ${INSTALL_DIR}/${BIN_NAME}${NC}"
+  echo -e "${BLUE}▶ Para iniciar manualmente: proxyjf${NC}"
 }
 
 # === EXECUÇÃO PRINCIPAL ===
