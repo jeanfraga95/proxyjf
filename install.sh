@@ -11,6 +11,9 @@ NC="\033[0m"
 INSTALL_DIR="/opt/proxyapp"
 BIN_NAME="proxy"
 GO_FILE="proxy.go"
+GO_REQUIRED_VERSION="1.16"
+GO_INSTALL_PATH="/usr/local/go"
+GO_BINARY="$GO_INSTALL_PATH/bin/go"
 DEPS=(curl wget unzip git g++ make libevent-dev)
 
 # === BARRA DE PROGRESSO ===
@@ -23,7 +26,7 @@ progress_bar() {
   echo -e "${NC}"
 }
 
-# === VERIFICA SE É UBUNTU ===
+# === VERIFICA SISTEMA ===
 check_system() {
   if ! grep -qi "ubuntu" /etc/os-release; then
     echo -e "${RED}❌ Este script só funciona em sistemas Ubuntu.${NC}"
@@ -78,39 +81,43 @@ install_dependencies() {
   fi
 }
 
-# === VERIFICA E INSTALA O GO SE NECESSÁRIO ===
+# === VERIFICA E INSTALA GO CORRETO ===
 ensure_go() {
-  REQUIRED_VERSION="1.16"
+  echo -e "${YELLOW}Verificando Go...${NC}"
 
-  CURRENT_GO=$(go version 2>/dev/null)
-  if [[ $? -eq 0 ]]; then
-    CURRENT_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
-    if dpkg --compare-versions "$CURRENT_VERSION" "ge" "$REQUIRED_VERSION"; then
-      echo -e "${GREEN}✔ Go $CURRENT_VERSION detectado.${NC}"
-      return
-    else
-      echo -e "${YELLOW}⚠ Versão do Go ($CURRENT_VERSION) é antiga. Atualizando...${NC}"
+  CURRENT_VERSION=$($GO_BINARY version 2>/dev/null | awk '{print $3}' | sed 's/go//')
+
+  if [ -z "$CURRENT_VERSION" ] || dpkg --compare-versions "$CURRENT_VERSION" "lt" "$GO_REQUIRED_VERSION"; then
+    echo -e "${YELLOW}⚠ Instalando Go 1.22.3...${NC}"
+    cd /tmp
+    wget -q https://go.dev/dl/go1.22.3.linux-amd64.tar.gz
+    rm -rf "$GO_INSTALL_PATH"
+    tar -C /usr/local -xzf go1.22.3.linux-amd64.tar.gz
+
+    # Adiciona ao PATH permanentemente se ainda não existir
+    if ! grep -q "/usr/local/go/bin" ~/.bashrc; then
+      echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
     fi
+    export PATH=$PATH:/usr/local/go/bin
+
+    echo -e "${GREEN}✔ Go 1.22.3 instalado com sucesso.${NC}"
   else
-    echo -e "${YELLOW}⚠ Go não está instalado. Instalando...${NC}"
+    echo -e "${GREEN}✔ Go $CURRENT_VERSION já está instalado.${NC}"
   fi
-
-  # Instalar Go manualmente
-  cd /tmp
-  wget -q https://go.dev/dl/go1.22.3.linux-amd64.tar.gz
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf go1.22.3.linux-amd64.tar.gz
-  export PATH=$PATH:/usr/local/go/bin
-  echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-
-  echo -e "${GREEN}✔ Go 1.22.3 instalado com sucesso.${NC}"
 }
 
-# === COMPILA O PROXY ===
+# === COMPILA O PROXY COM O GO CORRETO ===
 build_proxy() {
   echo -e "${YELLOW}Compilando proxy...${NC}"
   progress_bar
-  go build -o "$BIN_NAME" "$GO_FILE"
+
+  if [ ! -f "$GO_FILE" ]; then
+    echo -e "${RED}❌ Arquivo $GO_FILE não encontrado no diretório atual.${NC}"
+    exit 1
+  fi
+
+  $GO_BINARY build -o "$BIN_NAME" "$GO_FILE"
+
   if [ ! -f "$BIN_NAME" ]; then
     echo -e "${RED}❌ Erro ao compilar $GO_FILE.${NC}"
     exit 1
