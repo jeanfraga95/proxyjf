@@ -428,8 +428,8 @@ func main() {
 			return
 		}
 
-		certPath := "cert.pem"
-keyPath := "key.pem"
+		certPath := "/opt/proxyapp/cert.pem"
+keyPath := "/opt/proxyapp/key.pem"
 
 if _, err := os.Stat(certPath); os.IsNotExist(err) || os.IsNotExist(func() error { _, e := os.Stat(keyPath); return e }()) {
 	logMessage("Certificados não encontrados. Gerando cert.pem e key.pem...")
