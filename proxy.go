@@ -419,8 +419,7 @@ if sslConfig != nil {
 	logMessage(fmt.Sprintf("Proxy encerrado na porta %d", port))
 	os.Remove(pidFile)
 }
-
-func main() {
+	func main() {
 	if len(os.Args) > 1 {
 		port, err := strconv.Atoi(os.Args[1])
 		if err != nil {
@@ -429,22 +428,34 @@ func main() {
 		}
 
 		certPath := "/opt/proxyapp/cert.pem"
-keyPath := "/opt/proxyapp/key.pem"
-if _, errCert := os.Stat(certPath); os.IsNotExist(errCert) {
-	fmt.Println("📢 cert.pem não encontrado. Tentando gerar...")
-} else if _, errKey := os.Stat(keyPath); os.IsNotExist(errKey) {
-	fmt.Println("📢 key.pem não encontrado. Tentando gerar...")
-} else {
-	fmt.Println("✅ Certificados já existem. Pulando geração.")
-	return
-}
+		keyPath := "/opt/proxyapp/key.pem"
 
-if err := generateSelfSignedCert(certPath, keyPath); err != nil {
-	fmt.Println("❌ Erro ao gerar certificados:", err)
-} else {
-	fmt.Println("✅ Certificados gerados com sucesso.")
-}
-}
+		_, errCert := os.Stat(certPath)
+		_, errKey := os.Stat(keyPath)
+
+		if os.IsNotExist(errCert) || os.IsNotExist(errKey) {
+			fmt.Println("📢 Certificados não encontrados. Tentando gerar...")
+			if err := generateSelfSignedCert(certPath, keyPath); err != nil {
+				fmt.Println("❌ Erro ao gerar certificados:", err)
+			} else {
+				fmt.Println("✅ Certificados gerados com sucesso.")
+			}
+		} else {
+			fmt.Println("✅ Certificados já existem. Pulando geração.")
+		}
+
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err == nil {
+			sslConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			logMessage("✅ Certificados TLS carregados com sucesso")
+		} else {
+			logMessage("⚠️  Erro ao carregar certificados TLS: " + err.Error())
+		}
+
+		stopChan = make(chan struct{})
+		startProxy(port)
+		return
+	}
 
 cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 if err == nil {
