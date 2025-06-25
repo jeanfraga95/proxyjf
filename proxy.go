@@ -78,23 +78,11 @@ func detectProtocol(data []byte) string {
         strings.HasPrefix(dataStr, "COPY ") ||
         strings.HasPrefix(dataStr, "MOVE ") ||
         strings.HasPrefix(dataStr, "LOCK ") ||
-        strings.HasPrefix(dataStr, "UNLOCK ") ||
-if (strings.HasPrefix(dataStr, "GET ") ||
-    strings.HasPrefix(dataStr, "POST ") ||
-    strings.HasPrefix(dataStr, "PUT ") ||
-    strings.HasPrefix(dataStr, "DELETE ") ||
-    strings.HasPrefix(dataStr, "OPTIONS ") ||
-    strings.HasPrefix(dataStr, "HEAD ") ||
-    strings.HasPrefix(dataStr, "CONNECT ") ||
-    strings.HasPrefix(dataStr, "PATCH ") ||
-    strings.HasPrefix(dataStr, "PROPFIND ") ||
-    strings.HasPrefix(dataStr, "UNLOCK ") ||
-    strings.HasPrefix(dataStr, "SEARCH ")) &&
+        strings.HasPrefix(dataStr, "UNLOCK ") &&
    (strings.Contains(dataStrLower, "upgrade: websocket") ||
     strings.Contains(dataStrLower, "connection: keep-alive") ||
     strings.Contains(dataStrLower, "connection: websocket")) {
     return "websocket"
-}
 }
 
 }
