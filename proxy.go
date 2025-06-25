@@ -430,15 +430,20 @@ func main() {
 
 		certPath := "/opt/proxyapp/cert.pem"
 keyPath := "/opt/proxyapp/key.pem"
+if _, errCert := os.Stat(certPath); os.IsNotExist(errCert) {
+	fmt.Println("📢 cert.pem não encontrado. Tentando gerar...")
+} else if _, errKey := os.Stat(keyPath); os.IsNotExist(errKey) {
+	fmt.Println("📢 key.pem não encontrado. Tentando gerar...")
+} else {
+	fmt.Println("✅ Certificados já existem. Pulando geração.")
+	return
+}
 
-if _, err := os.Stat(certPath); os.IsNotExist(err) || os.IsNotExist(func() error { _, e := os.Stat(keyPath); return e }()) {
-	logMessage("Certificados não encontrados. Gerando cert.pem e key.pem...")
-
-	if err := generateSelfSignedCert(certPath, keyPath); err != nil {
-		logMessage(fmt.Sprintf("Erro ao gerar certificados: %v", err))
-	} else {
-		logMessage("✅ Certificados TLS autoassinados gerados com sucesso.")
-	}
+if err := generateSelfSignedCert(certPath, keyPath); err != nil {
+	fmt.Println("❌ Erro ao gerar certificados:", err)
+} else {
+	fmt.Println("✅ Certificados gerados com sucesso.")
+}
 }
 
 cert, err := tls.LoadX509KeyPair(certPath, keyPath)
