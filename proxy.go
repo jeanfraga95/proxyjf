@@ -80,7 +80,7 @@ func detectProtocol(data []byte) string {
 	strings.HasPrefix(dataStr, "LOCK ") ||
 	strings.HasPrefix(dataStr, "UNLOCK ") ||
 	strings.HasPrefix(dataStr, "SEARCH ")
-) && (
+ && (
 	strings.Contains(dataStrLower, "upgrade: websocket") ||
 	strings.Contains(dataStrLower, "connection: keep-alive") ||
 	strings.Contains(dataStrLower, "connection: websocket")
