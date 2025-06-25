@@ -456,7 +456,7 @@ if sslConfig != nil {
 		startProxy(port)
 		return
 	}
-	}
+	
 
 	execPath, _ := os.Executable()
 	scanner := bufio.NewScanner(os.Stdin)
