@@ -108,12 +108,10 @@ func detectProtocol(data []byte) string {
    strings.HasPrefix(dataStr, "LOCK ") ||
    strings.HasPrefix(dataStr, "UNLOCK ") ||
    strings.HasPrefix(dataStr, "SEARCH ") {
-	return "websocket"
+    return "websocket"
 }
 
-	
-	return "websocket"
-}
+return "websocket"
 
 // Função principal para lidar com conexões multiprotocolo
 func handleConnection(conn net.Conn) {
