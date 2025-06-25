@@ -456,18 +456,6 @@ if sslConfig != nil {
 		startProxy(port)
 		return
 	}
-
-cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-if err == nil {
-	sslConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-	logMessage("✅ Certificados TLS carregados com sucesso")
-} else {
-	logMessage("⚠️  Erro ao carregar certificados TLS: " + err.Error())
-}
-
-		stopChan = make(chan struct{})
-		startProxy(port)
-		return
 	}
 
 	execPath, _ := os.Executable()
