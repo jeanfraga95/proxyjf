@@ -14,7 +14,7 @@ GO_FILE="proxy.go"
 GO_REQUIRED_VERSION="1.16"
 GO_INSTALL_PATH="/usr/local/go"
 GO_BINARY="$GO_INSTALL_PATH/bin/go"
-DEPS=(curl wget unzip git g++ make libevent-dev)
+DEPS=(curl wget unzip git g++ make libevent-dev openssl)
 
 # === BARRA DE PROGRESSO ===
 progress_bar() {
@@ -57,7 +57,7 @@ remove_proxy() {
     systemctl disable proxy.service 2>/dev/null
     rm -rf "$INSTALL_DIR"
     rm -f /etc/systemd/system/proxy.service
-    rm -rf /usr/local/bin/proxyjf
+    rm -f /usr/local/bin/proxyjf
     systemctl daemon-reexec
     echo -e "${GREEN}✔ Proxy removido com sucesso.${NC}"
   else
@@ -75,6 +75,7 @@ install_dependencies() {
   if [ "${#MISSING[@]}" -gt 0 ]; then
     echo -e "${YELLOW}Instalando dependências...${NC}"
     progress_bar
+    apt-get update -y
     apt-get install -y "${MISSING[@]}" > /dev/null
   else
     echo -e "${GREEN}✔ Todas as dependências já estão instaladas.${NC}"
@@ -84,7 +85,6 @@ install_dependencies() {
 # === VERIFICA E INSTALA GO CORRETO ===
 ensure_go() {
   echo -e "${YELLOW}Verificando Go...${NC}"
-
   CURRENT_VERSION=$($GO_BINARY version 2>/dev/null | awk '{print $3}' | sed 's/go//')
 
   if [ -z "$CURRENT_VERSION" ] || dpkg --compare-versions "$CURRENT_VERSION" "lt" "$GO_REQUIRED_VERSION"; then
@@ -94,7 +94,6 @@ ensure_go() {
     rm -rf "$GO_INSTALL_PATH"
     tar -C /usr/local -xzf go1.22.3.linux-amd64.tar.gz
 
-    # Adiciona ao PATH permanentemente se ainda não existir
     if ! grep -q "/usr/local/go/bin" ~/.bashrc; then
       echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
     fi
@@ -106,35 +105,56 @@ ensure_go() {
   fi
 }
 
-# === COMPILA O PROXY COM O GO CORRETO ===
+# === BAIXA E COMPILA O PROXY ===
 build_proxy() {
-  echo -e "${YELLOW}Compilando proxy...${NC}"
-  progress_bar
+  echo -e "${YELLOW}Baixando código do proxy...${NC}"
+  mkdir -p /tmp/proxyjfsrc && cd /tmp/proxyjfsrc
+  wget -q -O "$GO_FILE" https://raw.githubusercontent.com/jeanfraga95/proxyjf/main/proxy.go
 
   if [ ! -f "$GO_FILE" ]; then
-    echo -e "${RED}❌ Arquivo $GO_FILE não encontrado no diretório atual.${NC}"
+    echo -e "${RED}❌ Falha ao baixar proxy.go do GitHub.${NC}"
     exit 1
   fi
 
+  echo -e "${YELLOW}Compilando proxy...${NC}"
   $GO_BINARY build -o "$BIN_NAME" "$GO_FILE"
 
   if [ ! -f "$BIN_NAME" ]; then
-    echo -e "${RED}❌ Erro ao compilar $GO_FILE.${NC}"
+    echo -e "${RED}❌ Erro ao compilar o proxy.${NC}"
     exit 1
+  fi
+}
+
+# === GERA CERTIFICADOS SSL ===
+generate_certs() {
+  echo -e "${YELLOW}Gerando certificados SSL para WSS...${NC}"
+  CERT_DIR="$INSTALL_DIR/certs"
+  mkdir -p "$CERT_DIR"
+
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout "$CERT_DIR/key.pem" \
+    -out "$CERT_DIR/cert.pem" \
+    -subj "/CN=localhost"
+
+  if [ -f "$CERT_DIR/cert.pem" ] && [ -f "$CERT_DIR/key.pem" ]; then
+    echo -e "${GREEN}✔ Certificados criados com sucesso.${NC}"
+  else
+    echo -e "${RED}❌ Erro ao gerar certificados.${NC}"
   fi
 }
 
 # === INSTALA O PROXY ===
 install_proxy() {
   build_proxy
+  remove_proxy
 
   echo -e "${YELLOW}Instalando proxy...${NC}"
   progress_bar
 
-  remove_proxy
-
   mkdir -p "$INSTALL_DIR"
-  cp "$BIN_NAME" "$INSTALL_DIR"
+  cp /tmp/proxyjfsrc/"$BIN_NAME" "$INSTALL_DIR"
+
+  generate_certs
 
   cat <<EOF > /etc/systemd/system/proxy.service
 [Unit]
@@ -150,11 +170,10 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
- systemctl daemon-reload
+  systemctl daemon-reload
   systemctl enable proxy.service
   systemctl start proxy.service
 
-  # Cria link simbólico para acesso global
   ln -sf "$INSTALL_DIR/$BIN_NAME" /usr/local/bin/proxyjf
 
   echo -e "${GREEN}✅ Instalação concluída com sucesso!${NC}"
