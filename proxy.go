@@ -275,7 +275,7 @@ func clearScreen() {
 func printHeader() {
 	clearScreen()
 	fmt.Println("╔══════════════════════════════════════╗")
-	fmt.Println("║        🚀 PROXY CloudJF v2.1 🚀       ║")
+	fmt.Println("║        🚀 PROXY CloudJF v2.1 🚀     ║")
 	fmt.Println("║      Multiprotocolo SSH Proxy        ║")
 	fmt.Println("╠══════════════════════════════════════╣")
 	fmt.Println("║  Suporta: WebSocket, SOCKS4-5        ║")
@@ -525,46 +525,55 @@ if sslConfig != nil {
 			waitForEnter()
 
 		case "2":
-			clearScreen()
-			printHeader()
-			fmt.Println("🔧 FECHAR PORTA")
-			fmt.Println("═══════════════")
-			fmt.Print("🔸 Digite a porta a ser fechada: ")
+	clearScreen()
+	printHeader()
+	fmt.Println("🔧 FECHAR PORTA")
+	fmt.Println("═══════════════")
+	fmt.Print("🔸 Digite a porta a ser fechada: ")
 
-			if !scanner.Scan() {
-				break
-			}
-			portStr := strings.TrimSpace(scanner.Text())
-			port, err := strconv.Atoi(portStr)
-			if err != nil || port < 1 || port > 65535 {
-				clearScreen()
-				printHeader()
-				fmt.Println("❌ Porta inválida!")
-				fmt.Print("📌 Pressione Enter para continuar...")
-				waitForEnter()
-				continue
-			}
+	if !scanner.Scan() {
+		break
+	}
+	portStr := strings.TrimSpace(scanner.Text())
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		clearScreen()
+		printHeader()
+		fmt.Println("❌ Porta inválida!")
+		fmt.Print("📌 Pressione Enter para continuar...")
+		waitForEnter()
+		continue
+	}
 
-			clearScreen()
-			printHeader()
-			fmt.Printf("⚠️  Tem certeza que deseja fechar a porta %d? (s/N): ", port)
+	clearScreen()
+	printHeader()
+	fmt.Printf("⚠️  Tem certeza que deseja fechar a porta %d? (s/N): ", port)
 
-			if !scanner.Scan() {
-				break
-			}
-			conf := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if !scanner.Scan() {
+		break
+	}
+	conf := strings.ToLower(strings.TrimSpace(scanner.Text()))
 
-			if conf == "s" || conf == "sim" {
-				if err := stopAndDisableService(port); err != nil {
-					fmt.Printf("❌ Erro ao parar service: %v\n", err)
-				} else {
-					fmt.Printf("✅ Porta %d encerrada com sucesso\n", port)
-				}
-			} else {
-				fmt.Println("❌ Operação cancelada")
- }
-			fmt.Print("📌 Pressione Enter para continuar...")
-			waitForEnter()
+	if conf == "s" || conf == "sim" {
+		fmt.Println("⏳ Encerrando porta, aguarde...")
+
+		start := time.Now()
+		err := stopAndDisableService(port)
+		elapsed := time.Since(start)
+		logMessage(fmt.Sprintf("Tempo para encerrar porta %d: %v", port, elapsed))
+
+		if err != nil {
+			fmt.Printf("❌ Erro ao parar service: %v\n", err)
+		} else {
+			fmt.Printf("✅ Porta %d encerrada com sucesso\n", port)
+		}
+	} else {
+		fmt.Println("❌ Operação cancelada")
+	}
+
+	fmt.Print("📌 Pressione Enter para continuar...")
+	waitForEnter()
+
 
 		case "3":
 			listActivePorts()
