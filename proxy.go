@@ -114,25 +114,30 @@ func detectProtocol(data []byte) string {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
-
 	buf := make([]byte, 8192)
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	n, err := conn.Read(buf)
+	conn.SetReadDeadline(time.Time{}) // remove timeout
+
+	var initialData []byte
 	if err != nil {
-		logMessage(fmt.Sprintf("Erro leitura inicial: %v", err))
-		sshRedirect(conn, nil, "tcp")
-		return
+		// Se for timeout, ainda assim pode ser uma conexão válida (ex: TCP puro)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			logMessage("Timeout leitura inicial, prosseguindo como TCP")
+			initialData = nil
+		} else {
+			logMessage(fmt.Sprintf("Erro leitura inicial: %v", err))
+			conn.Close()
+			return
+		}
+	} else {
+		initialData = buf[:n]
 	}
-	conn.SetReadDeadline(time.Time{})
 
-	initialData := buf[:n]
 	protocol := detectProtocol(initialData)
-
 	logMessage(fmt.Sprintf("Protocolo detectado: %s", protocol))
 
 	var resp string
-
 	switch protocol {
 	case "socks5", "socks4":
 		resp = "HTTP/1.1 200 OK\r\n\r\n"
@@ -140,7 +145,7 @@ func handleConnection(conn net.Conn) {
 
 	case "websocket":
 		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-		logMessage("Conexão WebSocket Security estabelecida")
+		logMessage("Conexão WebSocket estabelecida")
 
 	case "http":
 		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n"
@@ -151,11 +156,14 @@ func handleConnection(conn net.Conn) {
 		logMessage("Conexão TCP estabelecida")
 	}
 
-	if _, err := conn.Write([]byte(resp)); err != nil {
-		logMessage("Erro enviando resposta: " + err.Error())
-		return
+	// Envia resposta, se aplicável
+	if resp != "" {
+		if _, err := conn.Write([]byte(resp)); err != nil {
+			logMessage("Erro enviando resposta: " + err.Error())
+			conn.Close()
+			return
+		}
 	}
-
 	sshRedirect(conn, initialData, protocol)
 }
 
