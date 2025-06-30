@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,7 +24,6 @@ import (
 	"encoding/pem"
 	"math/big"
 )
-
 const (
 	logFilePath = "/var/log/proxyws.log"
 	pidFileDir  = "/var/run"
@@ -89,14 +90,13 @@ func detectProtocol(data []byte) string {
 		return "websocket"
 	}
 
-	// Detect HTTP/HTTPS
+	// Detect HTTP
 	if strings.HasPrefix(dataStr, "get ") || 
 	   strings.HasPrefix(dataStr, "post ") ||
 	   strings.HasPrefix(dataStr, "put ") ||
 	   strings.HasPrefix(dataStr, "delete ") ||
 	   strings.HasPrefix(dataStr, "options ") ||
 	   strings.HasPrefix(dataStr, "head ") ||
-	   strings.HasPrefix(dataStr, "connect ") ||
 	   strings.HasPrefix(dataStr, "patch ") ||
 	   strings.HasPrefix(dataStr, "trace ") ||
 	   strings.HasPrefix(dataStr, "propfind ") ||
@@ -107,31 +107,32 @@ func detectProtocol(data []byte) string {
 	   strings.HasPrefix(dataStr, "lock ") ||
 	   strings.HasPrefix(dataStr, "unlock ") ||
 	   strings.HasPrefix(dataStr, "search ") {
-		return "websocket"
+		return "http"
+	}
+
+	// Detect HTTP CONNECT
+	if strings.HasPrefix(dataStr, "connect ") {
+		return "http_connect"
 	}
 
 	return "websocket"
 }
 
 func handleConnection(conn net.Conn) {
-	buf := make([]byte, 8192)
-	conn.SetReadDeadline(time.Now().Add(readTimeout))
-	n, err := conn.Read(buf)
-	conn.SetReadDeadline(time.Time{}) // remove timeout
+	// Use the buffered connection to read initial data
+	bufConn, ok := conn.(*bufferedConn)
+	if !ok {
+		logMessage("Erro: conexão não é do tipo bufferedConn")
+		conn.Close()
+		return
+	}
 
-	var initialData []byte
-	if err != nil {
-		// Se for timeout, ainda assim pode ser uma conexão válida (ex: TCP puro)
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			logMessage("Timeout leitura inicial, prosseguindo como TCP")
-			initialData = nil
-		} else {
-			logMessage(fmt.Sprintf("Erro leitura inicial: %v", err))
-			conn.Close()
-			return
-		}
-	} else {
-		initialData = buf[:n]
+	// Read initial data from the buffered connection
+	initialData, err := bufConn.Peek(bufConn.Reader.Buffered())
+	if err != nil && err != io.EOF {
+		logMessage(fmt.Sprintf("Erro ao espiar dados iniciais: %v", err))
+		conn.Close()
+		return
 	}
 
 	protocol := detectProtocol(initialData)
@@ -147,9 +148,17 @@ func handleConnection(conn net.Conn) {
 		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
 		logMessage("Conexão WebSocket estabelecida")
 
+	case "http_connect":
+		// For HTTP CONNECT, we don't send an immediate response here.
+		// The sshRedirect will handle the CONNECT handshake.
+		logMessage("Conexão HTTP CONNECT detectada")
+		resp = ""
+
 	case "http":
-		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n"
-		logMessage("Conexão HTTP estabelecida")
+		// For plain HTTP, we also don't send an immediate response here.
+		// The sshRedirect will handle the HTTP request.
+		logMessage("Conexão HTTP detectada")
+		resp = ""
 
 	default:
 		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n"
@@ -168,31 +177,72 @@ func handleConnection(conn net.Conn) {
 }
 
 func sshRedirect(conn net.Conn, initialData []byte, protocol string) {
-	serverConn, err := net.Dial("tcp", "127.0.0.1:22")
-	if err != nil {
-		logMessage(fmt.Sprintf("Erro conectando servidor SSH: %v", err))
-		return
-	}
-	defer serverConn.Close()
+	var targetConn net.Conn
+	var targetAddr string
+	var err error // Declare err here
 
-	if protocol == "tcp" && initialData != nil && len(initialData) > 0 {
-		if _, err := serverConn.Write(initialData); err != nil {
-			logMessage(fmt.Sprintf("Erro enviando dados iniciais para SSH: %v", err))
+	if protocol == "http_connect" {
+		// Parse the CONNECT request to get the target address
+		reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
+		req, errReq := http.ReadRequest(reader)
+		if errReq != nil {
+			logMessage(fmt.Sprintf("Erro lendo requisição CONNECT: %v", errReq))
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 			return
 		}
+		targetAddr = req.Host
+		logMessage(fmt.Sprintf("CONNECT para: %s", targetAddr))
+
+		targetConn, err = net.Dial("tcp", targetAddr)
+		if err != nil {
+			logMessage(fmt.Sprintf("Erro conectando ao destino CONNECT %s: %v", targetAddr, err))
+			conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
+			return
+		}
+		// Send 200 OK to the client for CONNECT
+		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+
+	} else if protocol == "http" {
+		// For plain HTTP, forward to SSH server
+		targetAddr = "127.0.0.1:22"
+		targetConn, err = net.Dial("tcp", targetAddr)
+		if err != nil {
+			logMessage(fmt.Sprintf("Erro conectando servidor SSH para HTTP: %v", err))
+			return
+		}
+		// Write initial HTTP data to the SSH server
+		if _, err = targetConn.Write(initialData); err != nil {
+			logMessage(fmt.Sprintf("Erro enviando dados HTTP iniciais para SSH: %v", err))
+			return
+		}
+	} else {
+		// For other protocols (SOCKS, WebSocket, TCP), connect to SSH
+		targetAddr = "127.0.0.1:22"
+		targetConn, err = net.Dial("tcp", targetAddr)
+		if err != nil {
+			logMessage(fmt.Sprintf("Erro conectando servidor SSH: %v", err))
+			return
+		}
+		if initialData != nil && len(initialData) > 0 {
+			if _, err = targetConn.Write(initialData); err != nil {
+				logMessage(fmt.Sprintf("Erro enviando dados iniciais para SSH: %v", err))
+				return
+			}
+		}
 	}
+	defer targetConn.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(serverConn, conn)
+		io.Copy(targetConn, conn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, serverConn)
+		io.Copy(conn, targetConn)
 	}()
 
 	wg.Wait()
@@ -376,28 +426,21 @@ func waitForEnter() {
 
 func startProxy(port int) {
 	addr := fmt.Sprintf(":%d", port)
-	var listener net.Listener
-var err error
-
-if sslConfig != nil {
-	listener, err = tls.Listen("tcp", addr, sslConfig)
-	logMessage(fmt.Sprintf("🔐 Proxy seguro (WSS) iniciado na porta %d", port))
-} else {
-	listener, err = net.Listen("tcp", addr)
-	logMessage(fmt.Sprintf("🔓 Proxy não seguro (WS) iniciado na porta %d", port))
-}
+	
+	// Create a regular TCP listener
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		logMessage(fmt.Sprintf("Erro iniciando listener na porta %d: %v", port, err))
+		logMessage(fmt.Sprintf("Erro iniciando listener TCP na porta %d: %v", port, err))
 		return
 	}
 	defer listener.Close()
+
+	logMessage(fmt.Sprintf("Proxy multiprotocolo iniciado na porta %d (TCP)", port))
 
 	pidFile := fmt.Sprintf("%s/proxyws_%d.pid", pidFileDir, port)
 	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
 		logMessage(fmt.Sprintf("Falha ao gravar PID file: %v", err))
 	}
-
-	logMessage(fmt.Sprintf("Proxy multiprotocolo iniciado na porta %d", port))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -421,11 +464,58 @@ if sslConfig != nil {
 			break
 		}
 
-		go handleConnection(conn)
+		// Check if the connection is TLS
+		var clientConn net.Conn
+		peekedBytes := make([]byte, 5)
+		n, err := conn.Read(peekedBytes)
+		if err != nil {
+			logMessage(fmt.Sprintf("Erro ao ler bytes iniciais: %v", err))
+			conn.Close()
+			continue
+		}
+
+		isTLS := false
+		if n >= 1 && peekedBytes[0] == 0x16 { // TLS Handshake record type
+			isTLS = true
+		}
+
+		if isTLS && sslConfig != nil {
+			// Wrap the connection in a TLS server
+			tlsConn := tls.Server(conn, sslConfig)
+			err = tlsConn.Handshake()
+			if err != nil {
+				logMessage(fmt.Sprintf("Erro no handshake TLS: %v", err))
+				tlsConn.Close()
+				continue
+			}
+			clientConn = tlsConn
+			logMessage("Conexão TLS detectada e handshake bem-sucedido")
+			// Prepend the peeked bytes to the TLS connection
+			clientConn = &bufferedConn{Reader: bufio.NewReader(io.MultiReader(bytes.NewReader(peekedBytes[:n]), tlsConn)), Conn: tlsConn}
+		} else {
+			clientConn = &bufferedConn{Reader: bufio.NewReader(io.MultiReader(bytes.NewReader(peekedBytes[:n]), conn)), Conn: conn}
+			logMessage("Conexão TCP/HTTP detectada")
+		}
+
+		go handleConnection(clientConn)
 	}
 
 	logMessage(fmt.Sprintf("Proxy encerrado na porta %d", port))
 	os.Remove(pidFile)
+}
+
+// bufferedConn wraps a net.Conn and a bufio.Reader to allow peeking bytes
+type bufferedConn struct {
+	*bufio.Reader
+	net.Conn
+}
+
+func (b *bufferedConn) Read(p []byte) (n int, err error) {
+	return b.Reader.Read(p)
+}
+
+func (b *bufferedConn) Close() error {
+	return b.Conn.Close()
 }
 	func main() {
 	if len(os.Args) > 1 {
