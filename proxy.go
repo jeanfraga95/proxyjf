@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +23,7 @@ import (
 	"encoding/pem"
 	"math/big"
 )
+
 const (
 	logFilePath = "/var/log/proxyws.log"
 	pidFileDir  = "/var/run"
@@ -67,7 +67,7 @@ func detectProtocol(data []byte) string {
 		return "socks4"
 	}
 
-	// Detect WebSocket
+	// Detect WebSocket (or any non-SOCKS connection)
 	if (strings.HasPrefix(dataStr, "get ") ||
 		strings.HasPrefix(dataStr, "post ") ||
 		strings.HasPrefix(dataStr, "put ") ||
@@ -80,39 +80,14 @@ func detectProtocol(data []byte) string {
 		strings.HasPrefix(dataStr, "propfind ") ||
 		strings.HasPrefix(dataStr, "proppatch ") ||
 		strings.HasPrefix(dataStr, "mkcol ") ||
-		strings.HasPrefix(dataStr, "copy ") ||
-		strings.HasPrefix(dataStr, "move ") ||
+		strings.HasPrefix(dataStr, "copy ") ||		strings.HasPrefix(dataStr, "move ") ||
 		strings.HasPrefix(dataStr, "lock ") ||
-		strings.HasPrefix(dataStr, "unlock ")) &&
-		(strings.Contains(dataStr, "upgrade: websocket") ||
-			strings.Contains(dataStr, "connection: upgrade") ||
-			strings.Contains(dataStr, "connection: websocket")) {
+		strings.HasPrefix(dataStr, "unlock ") ||
+		strings.HasPrefix(dataStr, "search ") ||
+		strings.Contains(dataStr, "upgrade: websocket") ||
+		strings.Contains(dataStr, "connection: upgrade") ||
+		strings.Contains(dataStr, "connection: websocket")) {
 		return "websocket"
-	}
-
-	// Detect HTTP
-	if strings.HasPrefix(dataStr, "get ") || 
-	   strings.HasPrefix(dataStr, "post ") ||
-	   strings.HasPrefix(dataStr, "put ") ||
-	   strings.HasPrefix(dataStr, "delete ") ||
-	   strings.HasPrefix(dataStr, "options ") ||
-	   strings.HasPrefix(dataStr, "head ") ||
-	   strings.HasPrefix(dataStr, "patch ") ||
-	   strings.HasPrefix(dataStr, "trace ") ||
-	   strings.HasPrefix(dataStr, "propfind ") ||
-	   strings.HasPrefix(dataStr, "proppatch ") ||
-	   strings.HasPrefix(dataStr, "mkcol ") ||
-	   strings.HasPrefix(dataStr, "copy ") ||
-	   strings.HasPrefix(dataStr, "move ") ||
-	   strings.HasPrefix(dataStr, "lock ") ||
-	   strings.HasPrefix(dataStr, "unlock ") ||
-	   strings.HasPrefix(dataStr, "search ") {
-		return "http"
-	}
-
-	// Detect HTTP CONNECT
-	if strings.HasPrefix(dataStr, "connect ") {
-		return "http_connect"
 	}
 
 	return "websocket"
@@ -143,27 +118,13 @@ func handleConnection(conn net.Conn) {
 	case "socks5", "socks4":
 		resp = "HTTP/1.1 200 OK\r\n\r\n"
 		logMessage("Conexão SOCKS estabelecida")
-
-	case "websocket":
+	case "websocket", "http_connect", "http":
 		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-		logMessage("Conexão WebSocket estabelecida")
-
-	case "http_connect":
-		// For HTTP CONNECT, we don't send an immediate response here.
-		// The sshRedirect will handle the CONNECT handshake.
-		logMessage("Conexão HTTP CONNECT detectada")
-		resp = ""
-
-	case "http":
-		// For plain HTTP, we also don't send an immediate response here.
-		// The sshRedirect will handle the HTTP request.
-		logMessage("Conexão HTTP detectada")
-		resp = ""
+		logMessage(fmt.Sprintf("Conexão %s tratada como WebSocket", protocol))
 
 	default:
 		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n"
-		logMessage("Conexão TCP estabelecida")
-	}
+		logMessage("Conexão TCP tratada como WebSocket")	}
 
 	// Envia resposta, se aplicável
 	if resp != "" {
@@ -179,50 +140,32 @@ func handleConnection(conn net.Conn) {
 func sshRedirect(conn net.Conn, initialData []byte, protocol string) {
 	var targetConn net.Conn
 	var targetAddr string
-	var err error // Declare err here
+	var err error
 
-	if protocol == "http_connect" {
-		// Parse the CONNECT request to get the target address
-		reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
-		req, errReq := http.ReadRequest(reader)
-		if errReq != nil {
-			logMessage(fmt.Sprintf("Erro lendo requisição CONNECT: %v", errReq))
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-			return
-		}
-		targetAddr = req.Host
-		logMessage(fmt.Sprintf("CONNECT para: %s", targetAddr))
-
-		targetConn, err = net.Dial("tcp", targetAddr)
-		if err != nil {
-			logMessage(fmt.Sprintf("Erro conectando ao destino CONNECT %s: %v", targetAddr, err))
-			conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
-			return
-		}
-		// Send 200 OK to the client for CONNECT
-		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-
-	} else if protocol == "http" {
-		// For plain HTTP, forward to SSH server
+	if protocol == "socks5" || protocol == "socks4" {
+		// For SOCKS, connect to SSH
 		targetAddr = "127.0.0.1:22"
 		targetConn, err = net.Dial("tcp", targetAddr)
 		if err != nil {
-			logMessage(fmt.Sprintf("Erro conectando servidor SSH para HTTP: %v", err))
+			logMessage(fmt.Sprintf("Erro conectando servidor SSH para SOCKS: %v", err))
 			return
 		}
-		// Write initial HTTP data to the SSH server
-		if _, err = targetConn.Write(initialData); err != nil {
-			logMessage(fmt.Sprintf("Erro enviando dados HTTP iniciais para SSH: %v", err))
-			return
+		// Write initial SOCKS data to the SSH server
+		if initialData != nil && len(initialData) > 0 {
+			if _, err = targetConn.Write(initialData); err != nil {
+				logMessage(fmt.Sprintf("Erro enviando dados iniciais SOCKS para SSH: %v", err))
+				return
+			}
 		}
-	} else {
-		// For other protocols (SOCKS, WebSocket, TCP), connect to SSH
+	} else { // All other protocols (websocket, http, http_connect, tcp) are treated as websocket
+		// For WebSocket, HTTP, HTTP_CONNECT, and TCP, connect to SSH
 		targetAddr = "127.0.0.1:22"
 		targetConn, err = net.Dial("tcp", targetAddr)
 		if err != nil {
-			logMessage(fmt.Sprintf("Erro conectando servidor SSH: %v", err))
+			logMessage(fmt.Sprintf("Erro conectando servidor SSH para %s: %v", protocol, err))
 			return
 		}
+		// Write initial data to the SSH server
 		if initialData != nil && len(initialData) > 0 {
 			if _, err = targetConn.Write(initialData); err != nil {
 				logMessage(fmt.Sprintf("Erro enviando dados iniciais para SSH: %v", err))
