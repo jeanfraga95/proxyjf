@@ -180,19 +180,12 @@ func sshRedirect(conn net.Conn, initialData []byte, protocol string) {
 
 	go func() {
 		defer wg.Done()
-		// Read from the client connection (which is a bufferedConn) and write to the target SSH connection
-		// The buffered data from initial peek should be consumed by the first Read call on conn
-		if _, err := io.Copy(targetConn, conn); err != nil {
-			logMessage(fmt.Sprintf("Erro ao copiar dados do cliente para o SSH: %v", err))
-		}
+		io.Copy(targetConn, conn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		// Read from the target SSH connection and write back to the client connection
-		if _, err := io.Copy(conn, targetConn); err != nil {
-			logMessage(fmt.Sprintf("Erro ao copiar dados do SSH para o cliente: %v", err))
-		}
+		io.Copy(conn, targetConn)
 	}()
 
 	wg.Wait()
@@ -204,7 +197,7 @@ func systemdServicePath(port int) string {
 }
 
 func createSystemdService(port int, execPath string) error {
-	serviceContent := fmt.Sprintf(`[Unit]\nDescription=ProxyWS Multiprotocolo na porta %d\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=%s %d\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n`, port, execPath, port)
+	serviceContent := fmt.Sprintf(`[Unit]\nDescription=ProxyWS Multiprotocolo na porta %d\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/home/ubuntu/proxy-go %d\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n`, port, port)
 	path := systemdServicePath(port)
 	return os.WriteFile(path, []byte(serviceContent), 0644)
 }
