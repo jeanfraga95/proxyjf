@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -50,6 +49,8 @@ func logMessage(msg string) {
 	fmt.Fprintf(f, "[%s] %s\n", timestamp, msg)
 }
 
+// detectProtocol is no longer used in the same way as before, as the Rust logic is different.
+// We'll keep it for now but its role in handleConnection will change.
 func detectProtocol(data []byte) string {
 	if len(data) == 0 {
 		return "unknown"
@@ -94,102 +95,89 @@ func detectProtocol(data []byte) string {
 }
 
 func handleConnection(conn net.Conn) {
-	// Use the buffered connection to read initial data
-	bufConn, ok := conn.(*bufferedConn)
-	if !ok {
-		logMessage("Erro: conexão não é do tipo bufferedConn")
-		conn.Close()
+	defer conn.Close()
+
+	// Rust proxy sends 101 immediately
+	status := "@RustyManager" // This can be made configurable if needed
+	resp101 := fmt.Sprintf("HTTP/1.1 101 %s\r\n\r\n", status)
+	if _, err := conn.Write([]byte(resp101)); err != nil {
+		logMessage("Erro enviando resposta 101: " + err.Error())
 		return
 	}
+	logMessage("Enviado HTTP/1.1 101")
 
-	// Read initial data from the buffered connection
-	initialData, err := bufConn.Peek(bufConn.Reader.Buffered())
+	// Rust proxy reads some initial data and then sends 200
+	buffer := make([]byte, 1024)
+	_, err := conn.Read(buffer)
 	if err != nil && err != io.EOF {
-		logMessage(fmt.Sprintf("Erro ao espiar dados iniciais: %v", err))
-		conn.Close()
+		logMessage(fmt.Sprintf("Erro ao ler dados iniciais após 101: %v", err))
 		return
 	}
 
-	protocol := detectProtocol(initialData)
-	logMessage(fmt.Sprintf("Protocolo detectado: %s", protocol))
-
-	var resp string
-	switch protocol {
-	case "socks5", "socks4":
-		resp = "HTTP/1.1 200 OK\r\n\r\n"
-		logMessage("Conexão SOCKS estabelecida")
-	case "websocket", "http_connect", "http":
-		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-		logMessage(fmt.Sprintf("Conexão %s tratada como WebSocket", protocol))
-
-	default:
-		resp = "HTTP/1.1 101 Proxy CLOUDJF\r\n\r\n"
-		logMessage("Conexão TCP tratada como WebSocket")	}
-
-	// Envia resposta, se aplicável
-	if resp != "" {
-		if _, err := conn.Write([]byte(resp)); err != nil {
-			logMessage("Erro enviando resposta: " + err.Error())
-			conn.Close()
-			return
-		}
+	resp200 := fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", status)
+	if _, err := conn.Write([]byte(resp200)); err != nil {
+		logMessage("Erro enviando resposta 200: " + err.Error())
+		return
 	}
-	sshRedirect(conn, initialData, protocol)
-}
+	logMessage("Enviado HTTP/1.1 200")
 
-func sshRedirect(conn net.Conn, initialData []byte, protocol string) {
-	var targetConn net.Conn
+	// Peek into the stream to decide target address
+	// In Go, we can't easily 'peek' from a net.Conn like Rust's TcpStream.peek().
+	// The original Go code already reads initial bytes into peekedBytes.
+	// We'll use that for protocol detection, similar to Rust's peek_stream logic.
+	
+	// The original Go code already has peekedBytes from startProxy. We need to pass it.
+	// For now, let's assume the initial read into 'buffer' above serves this purpose
+	// and adapt the logic to use 'buffer' for protocol detection.
+
 	var targetAddr string
-	var err error
+	// Simulate Rust's peek_stream logic
+	dataStr := strings.ToUpper(string(buffer))
 
-	if protocol == "socks5" || protocol == "socks4" {
-		// For SOCKS, connect to SSH
+	if strings.Contains(dataStr, "SSH") || strings.TrimSpace(dataStr) == "" {
 		targetAddr = "127.0.0.1:22"
-		targetConn, err = net.Dial("tcp", targetAddr)
-		if err != nil {
-			logMessage(fmt.Sprintf("Erro conectando servidor SSH para SOCKS: %v", err))
-			return
-		}
-		// Write initial SOCKS data to the SSH server
-		if initialData != nil && len(initialData) > 0 {
-			if _, err = targetConn.Write(initialData); err != nil {
-				logMessage(fmt.Sprintf("Erro enviando dados iniciais SOCKS para SSH: %v", err))
-				return
-			}
-		}
-	} else { // All other protocols (websocket, http, http_connect, tcp) are treated as websocket
-		// For WebSocket, HTTP, HTTP_CONNECT, and TCP, connect to SSH
-		targetAddr = "127.0.0.1:22"
-		targetConn, err = net.Dial("tcp", targetAddr)
-		if err != nil {
-			logMessage(fmt.Sprintf("Erro conectando servidor SSH para %s: %v", protocol, err))
-			return
-		}
-		// Write initial data to the SSH server
-		if initialData != nil && len(initialData) > 0 {
-			if _, err = targetConn.Write(initialData); err != nil {
-				logMessage(fmt.Sprintf("Erro enviando dados iniciais para SSH: %v", err))
-				return
-			}
-		}
+		logMessage("Detectado SSH ou vazio, redirecionando para 127.0.0.1:22")
+	} else {
+		targetAddr = "127.0.0.1:1194"
+		logMessage("Detectado não-SSH, redirecionando para 127.0.0.1:1194")
+	}
+
+	// Connect to the target server
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		logMessage(fmt.Sprintf("Erro conectando ao servidor de destino %s: %v", targetAddr, err))
+		return
 	}
 	defer targetConn.Close()
 
+	// Write the initial buffered data to the target server
+	if _, err := targetConn.Write(buffer); err != nil {
+		logMessage(fmt.Sprintf("Erro enviando dados iniciais para o servidor de destino: %v", err))
+		return
+	}
+
+	// Bidirectional data transfer
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, conn)
+		// Read from the client connection and write to the target server connection
+		if _, err := io.Copy(targetConn, conn); err != nil {
+			logMessage(fmt.Sprintf("Erro ao copiar dados do cliente para o servidor de destino: %v", err))
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, targetConn)
+		// Read from the target server connection and write back to the client connection
+		if _, err := io.Copy(conn, targetConn); err != nil {
+			logMessage(fmt.Sprintf("Erro ao copiar dados do servidor de destino para o cliente: %v", err))
+		}
 	}()
 
 	wg.Wait()
-	logMessage(fmt.Sprintf("Conexão %s finalizada", protocol))
+	logMessage(fmt.Sprintf("Conexão finalizada com %s", targetAddr))
 }
 
 func systemdServicePath(port int) string {
@@ -197,7 +185,7 @@ func systemdServicePath(port int) string {
 }
 
 func createSystemdService(port int, execPath string) error {
-	serviceContent := fmt.Sprintf(`[Unit]\nDescription=ProxyWS Multiprotocolo na porta %d\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/home/ubuntu/proxy-go %d\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n`, port, port)
+	serviceContent := fmt.Sprintf(`[Unit]\nDescription=ProxyWS Multiprotocolo na porta %d\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=%s %d\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n`, execPath, port)
 	path := systemdServicePath(port)
 	return os.WriteFile(path, []byte(serviceContent), 0644)
 }
@@ -394,59 +382,21 @@ func startProxy(port int) {
 			break
 		}
 
-		// Check if the connection is TLS
-		var clientConn net.Conn
-		peekedBytes := make([]byte, 5)
-		n, err := conn.Read(peekedBytes)
-		if err != nil {
-			logMessage(fmt.Sprintf("Erro ao ler bytes iniciais: %v", err))
-			conn.Close()
-			continue
-		}
-
-		isTLS := false
-		if n >= 1 && peekedBytes[0] == 0x16 { // TLS Handshake record type
-			isTLS = true
-		}
-
-		if isTLS && sslConfig != nil {
-			// Wrap the connection in a TLS server
-			tlsConn := tls.Server(conn, sslConfig)
-			err = tlsConn.Handshake()
-			if err != nil {
-				logMessage(fmt.Sprintf("Erro no handshake TLS: %v", err))
-				tlsConn.Close()
-				continue
-			}
-			clientConn = tlsConn
-			logMessage("Conexão TLS detectada e handshake bem-sucedido")
-			// Prepend the peeked bytes to the TLS connection
-			clientConn = &bufferedConn{Reader: bufio.NewReader(io.MultiReader(bytes.NewReader(peekedBytes[:n]), tlsConn)), Conn: tlsConn}
-		} else {
-			clientConn = &bufferedConn{Reader: bufio.NewReader(io.MultiReader(bytes.NewReader(peekedBytes[:n]), conn)), Conn: conn}
-			logMessage("Conexão TCP/HTTP detectada")
-		}
-
-		go handleConnection(clientConn)
+		// In the Go version, we're not using bufferedConn and peekedBytes in the same way
+		// as the previous Go code. The Rust logic sends 101, then reads, then 200,
+		// then peeks (which is simulated by the read into 'buffer' in handleConnection).
+		// So, we directly pass the accepted connection to handleConnection.
+		go handleConnection(conn)
 	}
 
 	logMessage(fmt.Sprintf("Proxy encerrado na porta %d", port))
 	os.Remove(pidFile)
 }
 
-// bufferedConn wraps a net.Conn and a bufio.Reader to allow peeking bytes
-type bufferedConn struct {
-	*bufio.Reader
-	net.Conn
-}
-
-func (b *bufferedConn) Read(p []byte) (n int, err error) {
-	return b.Reader.Read(p)
-}
-
-func (b *bufferedConn) Close() error {
-	return b.Conn.Close()
-}
+// bufferedConn and related logic is removed as it's not directly applicable
+// to the Rust proxy's behavior of sending 101, reading, then 200.
+// The initial read in handleConnection will serve the purpose of consuming
+// the initial client data.
 
 func generateSelfSignedCert(certPath, keyPath string) error {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
