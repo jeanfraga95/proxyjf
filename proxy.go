@@ -117,8 +117,7 @@ func handleConnection(conn net.Conn) {
 	resp200 := fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", status)
 	if _, err := conn.Write([]byte(resp200)); err != nil {
 		logMessage("Erro enviando resposta 200: " + err.Error())
-		return
-	}
+		return	}
 	logMessage("Enviado HTTP/1.1 200")
 
 	// Peek into the stream to decide target address
