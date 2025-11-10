@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PORTS_FILE="/opt/rustyproxy/ports"
+PORTS_FILE="/opt/proxyc/ports"
 
 # Função para verificar se uma porta está em uso
 is_port_in_use() {
@@ -19,14 +19,14 @@ is_port_in_use() {
 # Função para abrir uma porta de proxy
 add_proxy_port() {
     local port=$1
-    local status=${2:-"@RustyProxy"}
+    local status=${2:-"ProxyC"}
 
     if is_port_in_use $port; then
         echo "A porta $port já está em uso."
         return
     fi
 
-    local command="/opt/rustyproxy/proxy --port $port --status $status"
+    local command="/opt/proxyc/proxy --port $port --status $status"
     local service_file_path="/etc/systemd/system/proxy${port}.service"
     local service_file_content="[Unit]
 Description=RustyProxy${port}
@@ -76,9 +76,9 @@ del_proxy_port() {
 # Função para exibir o menu formatado
 show_menu() {
     clear
-    echo "================= @RustyManager ================"
+    echo "================= Proxy C ================"
     echo "------------------------------------------------"
-    printf "|                  %-28s|\n" "RUSTY PROXY"
+    printf "|                  %-28s|\n" "Proxy C"
     echo "------------------------------------------------"
     
     # Verifica se há portas ativas
