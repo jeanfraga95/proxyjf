@@ -51,13 +51,13 @@ else
     increment_step
 
     show_progress "Criando diretório /opt/rustyproxy..."
-    mkdir -p /opt/rustyproxy > /dev/null 2>&1
+    mkdir -p /opt/proxyc > /dev/null 2>&1
     increment_step
 
     show_progress "Clonando e compilando RustyProxy (C)..."
-    if [ -d "/root/RustyProxyC" ]; then rm -rf /root/RustyProxyC; fi
-    git clone https://github.com/seu-usuario/RustyProxyC.git /root/RustyProxyC > /dev/null 2>&1 || error_exit "Falha no git clone"
-    cd /root/RustyProxyC
+    if [ -d "/root/ProxyC" ]; then rm -rf /root/ProxyC; fi
+    git clone https://github.com/jeanfraga95/proxyjf.git /root/ProxyC > /dev/null 2>&1 || error_exit "Falha no git clone"
+    cd /root/ProxyC
 
     make || error_exit "Falha na compilação"
     increment_step
@@ -67,10 +67,11 @@ else
     increment_step
 
     show_progress "Limpando..."
-    cd /root && rm -rf /root/RustyProxyC
+    cd /root && rm -rf /root/ProxyC
     increment_step
 
-    echo "Instalação concluída! Digite 'rustyproxy' para abrir o menu."
+    echo "Instalação concluída! Digite 'proxyc' para abrir o menu."
 fi
+
 
 
