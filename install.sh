@@ -24,7 +24,7 @@ else
     clear
     show_progress "Atualizando repositórios..."
     export DEBIAN_FRONTEND=noninteractive
-    apt update -y > /dev/null 2>&1 || error_exit "Falha ao atualizar repositórios"
+     > /dev/null 2>&1 || error_exit "Falha ao atualizar repositórios"
     increment_step
 
     show_progress "Verificando sistema..."
@@ -72,3 +72,4 @@ else
 
     echo "Instalação concluída! Digite 'rustyproxy' para abrir o menu."
 fi
+
