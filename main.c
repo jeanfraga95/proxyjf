@@ -29,7 +29,7 @@ typedef struct {
     int backend_count;
 } ProxyConfig;
 
-char *DEFAULT_STATUS = "@RustyManager";
+char *DEFAULT_STATUS = "@jfcloudjf95";
 int PORT = 80;
 ProxyConfig CONFIG = {0};
 
