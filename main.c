@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ctype.h>        // <-- NOVO: para strcasestr manual
 
 #define BUFFER_SIZE 8192
 #define PEEK_TIMEOUT 1
@@ -23,7 +24,19 @@ char *DEFAULT_STATUS = "@RustyManager";
 int PORT = 80;
 ProxyConfig CONFIG = {0};
 
-// =============== DETECÇÃO CORRETA DE proxyc: on (lê tudo!) ===============
+// strcasestr manual (sem warning)
+char* my_strcasestr(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return NULL;
+    int nlen = strlen(needle);
+    if (nlen == 0) return (char*)haystack;
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, nlen) == 0)
+            return (char*)haystack;
+    }
+    return NULL;
+}
+
+// DETECÇÃO PERFEITA DE proxyc: on
 int has_proxyc_on(int sock) {
     char buf[BUFFER_SIZE + 1] = {0};
     int total = 0;
@@ -31,20 +44,19 @@ int has_proxyc_on(int sock) {
         int n = recv(sock, buf + total, BUFFER_SIZE - total, MSG_PEEK);
         if (n <= 0) break;
         total += n;
-        if (strstr(buf, "\r\n\r\n")) break;  // já recebeu cabeçalhos completos
+        if (strstr(buf, "\r\n\r\n")) break;
     }
     buf[total] = '\0';
-    return (strcasestr(buf, "proxyc: on") != NULL);
+    return (my_strcasestr(buf, "proxyc: on") != NULL);
 }
-// =========================================================================
 
 void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) PORT = atoi(argv[i + 1]);
-        else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) DEFAULT_STATUS = argv[i + 1];
         else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
             char *t = strtok(argv[i + 1], ",");
-            while (t && CONFIG.status_count < MAX_STATUS) CONFIG.statuses[CONFIG.status_count++] = strdup(t), t = strtok(NULL, ",");
+            while (t && CONFIG.status_count < MAX_STATUS)
+                CONFIG.statuses[CONFIG.status_count++] = strdup(t), t = strtok(NULL, ",");
         } else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
             char *r = strtok(argv[i + 1], ",");
             while (r && CONFIG.backend_count < MAX_BACKEND) {
@@ -77,7 +89,8 @@ void *transfer(void *arg) {
     int *fds = (int*)arg;
     char buf[BUFFER_SIZE];
     int n;
-    while ((n = read(fds[0], buf, BUFFER_SIZE)) > 0) write(fds[1], buf, n);
+    while ((n = read(fds[0], buf, BUFFER_SIZE)) > 0)
+        if (write(fds[1], buf, n) <= 0) break;
     shutdown(fds[1], SHUT_WR); shutdown(fds[0], SHUT_RD);
     close(fds[0]); close(fds[1]); free(fds);
     return NULL;
@@ -98,21 +111,16 @@ void handle_client(int client_sock) {
     char resp[256];
     const char *status = get_random_status();
 
-    // === VERIFICAÇÃO CORRETA DO proxyc: on ===
     int use_200 = has_proxyc_on(client_sock);
 
-    // Primeira resposta: 101 ou 200
     snprintf(resp, sizeof(resp), "HTTP/1.1 %d %s\r\n\r\n", use_200 ? 200 : 101, status);
     write(client_sock, resp, strlen(resp));
 
-    // Consome o pedido completo
     read(client_sock, buf, BUFFER_SIZE);
 
-    // Segunda resposta: sempre 200
     snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
     write(client_sock, resp, strlen(resp));
 
-    // PEEK para detectar SSH/OVPN
     int peeked = peek_data(client_sock, buf, sizeof(buf)-1);
     BackendRule *backend = detect_backend(buf, peeked);
 
@@ -171,7 +179,7 @@ int main(int argc, char *argv[]) {
     if (bind(server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(server_sock, 256) < 0) { perror("listen"); return 1; }
 
-    printf("ProxyC FINAL - 200+200+túnel | Porta %d\n", PORT);
+    printf("ProxyC FINAL 2025 - 200+200+túnel | Porta %d\n", PORT);
 
     pthread_t thread;
     pthread_create(&thread, NULL, accept_loop, &server_sock);
