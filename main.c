@@ -110,17 +110,37 @@ void handle_client(int client_sock) {
     char resp[256];
     const char *status = get_random_status();
 
-    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-    write(client_sock, resp, strlen(resp));
+    // Peek the initial request to check for the header
+    int peeked = peek_data(client_sock, buf, sizeof(buf)-1);
+    int has_proxyc_header = (strstr(buf, "proxyc:on") != NULL) || (strstr(buf, "proxyc: on") != NULL);
 
-    read(client_sock, buf, BUFFER_SIZE);
+    if (has_proxyc_header) {
+        // Send 200 twice
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+        write(client_sock, resp, strlen(resp));
+    } else {
+        // Send 101 and then 200
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
 
-    snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
-    write(client_sock, resp, strlen(resp));
+        read(client_sock, buf, BUFFER_SIZE);  // Consume the request
+
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+    }
+
+    // Now peek for backend detection (after consuming the request if not already)
+    if (!has_proxyc_header) {
+        // Already consumed with read above
+    } else {
+        // Need to consume the request now
+        read(client_sock, buf, BUFFER_SIZE);
+    }
 
     char peek[BUFFER_SIZE] = {0};
-    int peeked = peek_data(client_sock, peek, sizeof(peek)-1);
-    BackendRule *backend = detect_backend(peek, peeked);
+    int peeked_backend = peek_data(client_sock, peek, sizeof(peek)-1);
+    BackendRule *backend = detect_backend(peek, peeked_backend);
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) { close(client_sock); return; }
@@ -146,7 +166,7 @@ void handle_client(int client_sock) {
 }
 
 void *accept_loop(void *arg) {
-    int server_sock = *(int*)arg;  // <-- CORRIGIDO AQUI!
+    int server_sock = *(int*)arg;
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
