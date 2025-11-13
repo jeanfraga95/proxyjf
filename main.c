@@ -29,51 +29,38 @@ typedef struct {
     int backend_count;
 } ProxyConfig;
 
-char *DEFAULT_STATUS = "@RustyManager";
+char *DEFAULT_STATUS = "@cloudjf95";
 int PORT = 80;
 ProxyConfig CONFIG = {0};
 
-// ==================== NOVO: DETECÇÃO DE proxyc: on ====================
+// DETECÇÃO DE proxyc: on (case insensitive)
 int has_proxyc_on(const char *data, int len) {
-    if (len < 10) return 0;
+    if (len < 12) return 0;
     char temp[BUFFER_SIZE];
     int copy = len < BUFFER_SIZE - 1 ? len : BUFFER_SIZE - 1;
     memcpy(temp, data, copy);
     temp[copy] = '\0';
-
-    // Procura por "proxyc: on" ou "Proxyc: on" ou "PROXYC: ON"
-    char *p = temp;
-    while ((p = strstr(p, "proxyc:"))) {
-        p += 7;
-        while (*p == ' ' || *p == '\t') p++;
-        if (strncmp(p, "on", 2) == 0 || strncmp(p, "ON", 2) == 0 || strncmp(p, "On", 2) == 0) {
-            return 1;
-        }
-    }
-    return 0;
+    return (strcasestr(temp, "proxyc: on") != NULL);
 }
-// ======================================================================
 
 void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) PORT = atoi(argv[i + 1]);
         else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) DEFAULT_STATUS = argv[i + 1];
         else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
-            char *token = strtok(argv[i + 1], ",");
-            while (token && CONFIG.status_count < MAX_STATUS) {
-                CONFIG.statuses[CONFIG.status_count++] = strdup(token);
-                token = strtok(NULL, ",");
-            }
+            char *t = strtok(argv[i + 1], ",");
+            while (t && CONFIG.status_count < MAX_STATUS)
+                CONFIG.statuses[CONFIG.status_count++] = strdup(t), t = strtok(NULL, ",");
         } else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
-            char *rule = strtok(argv[i + 1], ",");
-            while (rule && CONFIG.backend_count < MAX_BACKEND) {
-                char pattern[64], host[64]; int port;
-                if (sscanf(rule, "%63[^:]:%63[^:]:%d", pattern, host, &port) == 3) {
-                    strcpy(CONFIG.backends[CONFIG.backend_count].pattern, pattern);
+            char *r = strtok(argv[i + 1], ",");
+            while (r && CONFIG.backend_count < MAX_BACKEND) {
+                char pat[64], host[64]; int p;
+                if (sscanf(r, "%63[^:]:%63[^:]:%d", pat, host, &p) == 3) {
+                    strcpy(CONFIG.backends[CONFIG.backend_count].pattern, pat);
                     strcpy(CONFIG.backends[CONFIG.backend_count].host, host);
-                    CONFIG.backends[CONFIG.backend_count++].port = port;
+                    CONFIG.backends[CONFIG.backend_count++].port = p;
                 }
-                rule = strtok(NULL, ",");
+                r = strtok(NULL, ",");
             }
         }
     }
@@ -88,11 +75,11 @@ void parse_args(int argc, char *argv[]) {
     }
 }
 
-int peek_data(int sock, char *buffer, int len) {
+int peek_data(int sock, char *buf, int len) {
     struct timeval tv = {PEEK_TIMEOUT, 0};
     fd_set fds; FD_ZERO(&fds); FD_SET(sock, &fds);
     if (select(sock + 1, &fds, NULL, NULL, &tv) <= 0) return 0;
-    return recv(sock, buffer, len, MSG_PEEK);
+    return recv(sock, buf, len, MSG_PEEK);
 }
 
 void *transfer(void *arg) {
@@ -114,10 +101,9 @@ const char* get_random_status() {
 
 BackendRule* detect_backend(const char *data, int len) {
     if (len <= 0) return &CONFIG.backends[1];
-    for (int i = 0; i < CONFIG.backend_count; i++) {
+    for (int i = 0; i < CONFIG.backend_count; i++)
         if (CONFIG.backends[i].pattern[0] && strstr(data, CONFIG.backends[i].pattern))
             return &CONFIG.backends[i];
-    }
     return &CONFIG.backends[1];
 }
 
@@ -126,33 +112,23 @@ void handle_client(int client_sock) {
     char resp[512];
     const char *status = get_random_status();
 
-    // Lê os primeiros bytes para analisar
+    // PEEK para ver o cabeçalho
     int peeked = peek_data(client_sock, buf, sizeof(buf)-1);
+    int use_200_instead_of_101 = has_proxyc_on(buf, peeked);
 
-    // NOVO: Verifica se tem proxyc: on
-    int force_200 = has_proxyc_on(buf, peeked);
-
-    if (force_200) {
-        // Responde 200 OK em vez de 101
-        snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 %s\r\n"
-            "Connection: keep-alive\r\n"
-            "Content-Length: 0\r\n"
-            "\r\n", status);
-        write(client_sock, resp, strlen(resp));
-        close(client_sock);
-        return;
-    }
-
-    // Comportamento normal (101 + túnel)
-    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+    // PRIMEIRA RESPOSTA: 101 ou 200 dependendo do proxyc: on
+    snprintf(resp, sizeof(resp), "HTTP/1.1 %d %s\r\n\r\n", 
+             use_200_instead_of_101 ? 200 : 101, status);
     write(client_sock, resp, strlen(resp));
 
-    read(client_sock, buf, BUFFER_SIZE);  // consome o pedido
+    // Consome o pedido
+    read(client_sock, buf, BUFFER_SIZE);
 
+    // SEGUNDA RESPOSTA: sempre 200
     snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
     write(client_sock, resp, strlen(resp));
 
+    // SEMPRE abre o túnel (SSH ou OVPN) — independente do proxyc: on
     BackendRule *backend = detect_backend(buf, peeked);
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -169,8 +145,8 @@ void handle_client(int client_sock) {
     }
 
     pthread_t t1, t2;
-    int *c2s = malloc(2*sizeof(int)); c2s[0]=client_sock; c2s[1]=server_sock;
-    int *s2c = malloc(2*sizeof(int)); s2c[0]=server_sock; s2c[1]=client_sock;
+    int *c2s = malloc(2*sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
+    int *s2c = malloc(2*sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
@@ -210,7 +186,7 @@ int main(int argc, char *argv[]) {
     if (bind(server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(server_sock, 256) < 0) { perror("listen"); return 1; }
 
-    printf("ProxyC + proxyc:on → 200 OK | Porta: %d | Status: %d\n", PORT, CONFIG.status_count);
+    printf("ProxyC Final | 200+200 com túnel | Porta: %d\n", PORT);
 
     pthread_t thread;
     pthread_create(&thread, NULL, accept_loop, &server_sock);
