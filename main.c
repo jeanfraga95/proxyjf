@@ -33,6 +33,17 @@ char *DEFAULT_STATUS = "@RustyManager";
 int PORT = 80;
 ProxyConfig CONFIG = {0};
 
+// ====================== NOVO: DETECÇÃO DE proxyc: on ======================
+int has_proxyc_on(const char *buf, int len) {
+    if (len < 15) return 0;
+    char temp[BUFFER_SIZE];
+    int copylen = len < BUFFER_SIZE - 1 ? len : BUFFER_SIZE - 1;
+    memcpy(temp, buf, copylen);
+    temp[copylen] = '\0';
+    return (strstr(temp, "proxyc: on") != NULL || strstr(temp, "Proxyc: on") != NULL || strstr(temp, "PROXYC: ON") != NULL);
+}
+// =========================================================================
+
 void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -59,10 +70,9 @@ void parse_args(int argc, char *argv[]) {
             }
         }
     }
-
     if (CONFIG.backend_count == 0) {
         strcpy(CONFIG.backends[0].pattern, "SSH"); strcpy(CONFIG.backends[0].host, "0.0.0.0"); CONFIG.backends[0].port = 22;
-        strcpy(CONFIG.backends[1].pattern, "");    strcpy(CONFIG.backends[1].host, "0.0.0.0"); CONFIG.backends[1].port = 1194;
+        strcpy(CONFIG.backends[1].pattern, ""); strcpy(CONFIG.backends[1].host, "0.0.0.0"); CONFIG.backends[1].port = 1194;
         CONFIG.backend_count = 2;
     }
     if (CONFIG.status_count == 0) {
@@ -110,17 +120,23 @@ void handle_client(int client_sock) {
     char resp[256];
     const char *status = get_random_status();
 
-    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+    // PEEK para verificar se tem proxyc: on
+    int peeked = peek_data(client_sock, buf, sizeof(buf)-1);
+    int use_200 = has_proxyc_on(buf, peeked);
+
+    // PRIMEIRA RESPOSTA: 101 ou 200 dependendo do header
+    snprintf(resp, sizeof(resp), "HTTP/1.1 %d %s\r\n\r\n", use_200 ? 200 : 101, status);
     write(client_sock, resp, strlen(resp));
 
+    // Consome o pedido (exatamente como antes)
     read(client_sock, buf, BUFFER_SIZE);
 
+    // SEGUNDA RESPOSTA: sempre 200 (igual antes)
     snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
     write(client_sock, resp, strlen(resp));
 
-    char peek[BUFFER_SIZE] = {0};
-    int peeked = peek_data(client_sock, peek, sizeof(peek)-1);
-    BackendRule *backend = detect_backend(peek, peeked);
+    // Usa o mesmo buffer já consumido para detectar backend (igual antes)
+    BackendRule *backend = detect_backend(buf, peeked);
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) { close(client_sock); return; }
@@ -146,10 +162,9 @@ void handle_client(int client_sock) {
 }
 
 void *accept_loop(void *arg) {
-    int server_sock = *(int*)arg;  // <-- CORRIGIDO AQUI!
+    int server_sock = *(int*)arg;
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-
     while (1) {
         int client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
         if (client_sock < 0) {
@@ -157,7 +172,6 @@ void *accept_loop(void *arg) {
             perror("accept");
             continue;
         }
-
         pid_t pid = fork();
         if (pid == 0) {
             close(server_sock);
@@ -187,7 +201,7 @@ int main(int argc, char *argv[]) {
     if (bind(server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(server_sock, 256) < 0) { perror("listen"); return 1; }
 
-    printf("ProxyC rodando na porta %d | Multi-status: %d | Backends: %d\n", PORT, CONFIG.status_count, CONFIG.backend_count);
+    printf("ProxyC + proxyc:on → 200+200+túnel | Porta: %d\n", PORT);
 
     pthread_t thread;
     pthread_create(&thread, NULL, accept_loop, &server_sock);
