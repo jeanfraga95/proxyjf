@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2 -pthread
 TARGET = proxy
 SOURCES = main.c
-INSTALL_PATH = /opt/rustyproxy
+INSTALL_PATH = /opt/proxyc
 
 all: $(TARGET)
 
@@ -14,7 +14,8 @@ install: $(TARGET)
 	sudo cp $(TARGET) $(INSTALL_PATH)/
 	sudo cp menu.sh $(INSTALL_PATH)/menu
 	sudo chmod +x $(INSTALL_PATH)/proxy $(INSTALL_PATH)/menu
-	sudo ln -sf $(INSTALL_PATH)/menu /usr/local/bin/rustyproxy
+	sudo ln -sf $(INSTALL_PATH)/menu /usr/local/bin/proxyc
 
 clean:
 	rm -f $(TARGET)
+
