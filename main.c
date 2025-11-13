@@ -14,7 +14,7 @@
 #define BUFFER_SIZE 8192
 #define PEEK_TIMEOUT 1
 
-char *STATUS_MESSAGE = "@RustyManager";
+char *STATUS_MESSAGE = "@cloudjf95";
 int PORT = 80;
 
 void parse_args(int argc, char *argv[]) {
