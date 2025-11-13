@@ -19,7 +19,7 @@ is_port_in_use() {
 # Função para abrir uma porta de proxy
 add_proxy_port() {
     local port=$1
-    local status=${2:-"ProxyC"}
+    local status=${2:-"C"}
 
     if is_port_in_use $port; then
         echo "A porta $port já está em uso."
@@ -51,8 +51,8 @@ WantedBy=multi-user.target"
 
     echo "$service_file_content" | sudo tee "$service_file_path" > /dev/null
     sudo systemctl daemon-reload
-    sudo systemctl enable "proxy${port}.service"
-    sudo systemctl start "proxy${port}.service"
+    sudo systemctl enable "proxyc${port}.service"
+    sudo systemctl start "proxyc${port}.service"
 
     # Salvar a porta no arquivo
     echo $port >> "$PORTS_FILE"
@@ -63,9 +63,9 @@ WantedBy=multi-user.target"
 del_proxy_port() {
     local port=$1
 
-    sudo systemctl disable "proxy${port}.service"
-    sudo systemctl stop "proxy${port}.service"
-    sudo rm -f "/etc/systemd/system/proxy${port}.service"
+    sudo systemctl disable "proxyc${port}.service"
+    sudo systemctl stop "proxyc${port}.service"
+    sudo rm -f "/etc/systemd/system/proxyc${port}.service"
     sudo systemctl daemon-reload
 
     # Remover a porta do arquivo
