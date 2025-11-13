@@ -1,5 +1,5 @@
 #!/bin/bash
-# rustyproxy Installer (C Version)
+# proxy Installer (C Version)
 
 TOTAL_STEPS=9
 CURRENT_STEP=0
@@ -50,11 +50,11 @@ else
     apt install build-essential git -y > /dev/null 2>&1 || error_exit "Falha ao instalar pacotes"
     increment_step
 
-    show_progress "Criando diretório /opt/rustyproxy..."
+    show_progress "Criando diretório /opt/proxyc..."
     mkdir -p /opt/proxyc > /dev/null 2>&1
     increment_step
 
-    show_progress "Clonando e compilando RustyProxy (C)..."
+    show_progress "Clonando e compilando Proxy (C)..."
     if [ -d "/root/ProxyC" ]; then rm -rf /root/ProxyC; fi
     git clone https://github.com/jeanfraga95/proxyjf.git /root/ProxyC > /dev/null 2>&1 || error_exit "Falha no git clone"
     cd /root/ProxyC
@@ -72,6 +72,7 @@ else
 
     echo "Instalação concluída! Digite 'proxyc' para abrir o menu."
 fi
+
 
 
 
