@@ -62,7 +62,7 @@ void parse_args(int argc, char *argv[]) {
 
     if (CONFIG.backend_count == 0) {
         strcpy(CONFIG.backends[0].pattern, "SSH"); strcpy(CONFIG.backends[0].host, "0.0.0.0"); CONFIG.backends[0].port = 22;
-        strcpy(CONFIG.backends[1].pattern, "");    strcpy(CONFIG.backends[1].host, "0.0.0.0"); CONFIG.backends[1].port = 1194;
+        strcpy(CONFIG.backends[1].pattern, "");    strcpy(CONFIG.backends[1].host, "0.0.0.0"); CONFIG.backends[1].port = 22;
         CONFIG.backend_count = 2;
     }
     if (CONFIG.status_count == 0) {
