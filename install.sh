@@ -1,7 +1,7 @@
 #!/bin/bash
-# proxy Installer (C Version)
+# proxy Installer (C Version) - REINSTALL
 
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 CURRENT_STEP=0
 
 show_progress() {
@@ -22,9 +22,10 @@ if [ "$EUID" -ne 0 ]; then
     error_exit "EXECUTE COMO ROOT"
 else
     clear
+
     show_progress "Atualizando repositórios..."
     export DEBIAN_FRONTEND=noninteractive
-     > /dev/null 2>&1 || error_exit "Falha ao atualizar repositórios"
+    apt update > /dev/null 2>&1 || error_exit "Falha ao atualizar repositórios"
     increment_step
 
     show_progress "Verificando sistema..."
@@ -46,8 +47,30 @@ else
     increment_step
 
     show_progress "Atualizando sistema..."
-     > /dev/null 2>&1
+    apt upgrade -y > /dev/null 2>&1
     apt install build-essential git -y > /dev/null 2>&1 || error_exit "Falha ao instalar pacotes"
+    increment_step
+
+    # =========================
+    # REMOÇÃO COMPLETA ANTIGA
+    # =========================
+    show_progress "Removendo instalação antiga..."
+
+    # parar serviços systemd relacionados (caso existam)
+    systemctl stop proxyc 2>/dev/null
+    systemctl disable proxyc 2>/dev/null
+
+    # remover services dinamicos tipo proxyeuro@PORTA
+    for svc in $(systemctl list-units --type=service | grep proxy | awk '{print $1}'); do
+        systemctl stop $svc 2>/dev/null
+        systemctl disable $svc 2>/dev/null
+    done
+
+    # remover arquivos
+    rm -rf /opt/proxyc
+    rm -f /usr/local/bin/proxyc
+    rm -rf /root/ProxyC
+
     increment_step
 
     show_progress "Criando diretório /opt/proxyc..."
@@ -55,7 +78,6 @@ else
     increment_step
 
     show_progress "Clonando e compilando Proxy (C)..."
-    if [ -d "/root/ProxyC" ]; then rm -rf /root/ProxyC; fi
     git clone https://github.com/jeanfraga95/proxyjf.git /root/ProxyC > /dev/null 2>&1 || error_exit "Falha no git clone"
     cd /root/ProxyC
 
@@ -72,7 +94,3 @@ else
 
     echo "Instalação concluída! Digite 'proxyc' para abrir o menu."
 fi
-
-
-
-
