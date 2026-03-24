@@ -19,7 +19,7 @@ is_port_in_use() {
 # Função para abrir uma porta de proxy
 add_proxy_port() {
     local port=$1
-    local status=${2:-"C"}
+    local status=${2:-"Metodo Backend"}
 
     if is_port_in_use $port; then
         echo "A porta $port já está em uso."
@@ -97,6 +97,7 @@ show_menu() {
     printf "| %-45s|\n" "2 - Fechar Porta"
     printf "| %-45s|\n" "0 - Voltar ao menu"
     printf "| %-45s|\n" "3 - Abrir Gerenciador"
+    printf "| %-45s|\n" "4 - Ir para o Menu do script ssh"
     echo "------------------------------------------------"
     echo
     read -p " --> Selecione uma opção: " option
@@ -126,6 +127,12 @@ show_menu() {
             ;;
         3)
             htop
+            ;;
+        4)
+            menu
+            if !(menu){
+            echo "script ssh não encontrado ou ausente"
+            }
             ;;
         *)
             echo "Opção inválida. Pressione qualquer tecla para voltar ao menu."
