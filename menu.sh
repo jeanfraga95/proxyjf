@@ -96,6 +96,7 @@ show_menu() {
     printf "| %-45s|\n" "1 - Abrir Porta"
     printf "| %-45s|\n" "2 - Fechar Porta"
     printf "| %-45s|\n" "0 - Voltar ao menu"
+    printf "| %-45s|\n" "3 - Abrir Gerenciador"
     echo "------------------------------------------------"
     echo
     read -p " --> Selecione uma opção: " option
@@ -122,6 +123,9 @@ show_menu() {
             ;;
         0)
             exit 0
+            ;;
+        3)
+            htop
             ;;
         *)
             echo "Opção inválida. Pressione qualquer tecla para voltar ao menu."
