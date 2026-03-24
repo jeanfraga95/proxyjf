@@ -128,12 +128,7 @@ show_menu() {
         3)
             htop
             ;;
-        4)
-            menu
-            if !(menu){
-            echo "script ssh não encontrado ou ausente"
-            }
-            ;;
+       
         *)
             echo "Opção inválida. Pressione qualquer tecla para voltar ao menu."
             read -n 1 dummy
