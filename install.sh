@@ -47,7 +47,6 @@ else
     increment_step
 
     show_progress "Atualizando sistema..."
-    apt upgrade -y > /dev/null 2>&1
     apt install build-essential git -y > /dev/null 2>&1 || error_exit "Falha ao instalar pacotes"
     increment_step
 
