@@ -23,11 +23,6 @@ if [ "$EUID" -ne 0 ]; then
 else
     clear
 
-    show_progress "Atualizando repositórios..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt update > /dev/null 2>&1 || error_exit "Falha ao atualizar repositórios"
-    increment_step
-
     show_progress "Verificando sistema..."
     if ! command -v lsb_release &> /dev/null; then
         apt install lsb-release -y > /dev/null 2>&1
