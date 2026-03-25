@@ -116,7 +116,7 @@ void handle_client(int client_sock) {
 
     if (has_proxyc_header) {
         // Send 200 twice
-        snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
     } else {
@@ -130,7 +130,7 @@ if (received <= 0) {
     return;
 }
 
-        snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
@@ -139,7 +139,10 @@ if (received <= 0) {
         // Already consumed with read above
     } else {
         // Need to consume the request now
-        read(client_sock, buf, BUFFER_SIZE);
+        int received = recv(client_sock, buf, int available = peek_data(client_sock, buf, sizeof(buf)-1);
+if (available > 0) {
+    recv(client_sock, buf, available, 0);
+}
     }
 
     char peek[BUFFER_SIZE] = {0};
