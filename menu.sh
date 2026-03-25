@@ -78,7 +78,7 @@ show_menu() {
     clear
     echo "================= Proxy C ================"
     echo "------------------------------------------------"
-    printf "|                  %-28s|\n" "Proxy C"
+    printf "|                  %-28s|\n" "Proxy C 1.1"
     echo "------------------------------------------------"
     
     # Verifica se há portas ativas
