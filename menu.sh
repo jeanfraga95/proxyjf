@@ -92,15 +92,19 @@ show_menu() {
         printf "| Portas(s):%-35s|\n" "$active_ports"
     fi
 
-    echo "------------------------------------------------"
-    printf "| %-45s|\n" "1 - Abrir Porta"
-    printf "| %-45s|\n" "2 - Fechar Porta"
-    printf "| %-45s|\n" "0 - Voltar ao menu"
-    printf "| %-45s|\n" "3 - Abrir Gerenciador"
-    printf "| %-45s|\n" "4 - Ir para o Menu do script ssh"
-    echo "------------------------------------------------"
-    echo
-    read -p " --> Selecione uma opção: " option
+   echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${CYAN}║${RESET}              ${BOLD}${WHITE}MENU DE CONTROLE${RESET}                            ${CYAN}║${RESET}"
+echo -e "${CYAN}╠════════════════════════════════════════════════════════════╣${RESET}"
+
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "1" "Abrir Porta"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "2" "Fechar Porta"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "3" "Abrir Gerenciador"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "4" "Ir para o Menu do script SSH"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "0" "Voltar ao menu anterior"
+
+echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${RESET}"
+echo
+read -p "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
 
     case $option in
         1)
