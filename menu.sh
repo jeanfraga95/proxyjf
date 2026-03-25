@@ -128,6 +128,9 @@ show_menu() {
         3)
             htop
             ;;
+        4)
+            menu
+            ;;
        
         *)
             echo "Opção inválida. Pressione qualquer tecla para voltar ao menu."
