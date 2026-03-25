@@ -11,7 +11,7 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define BUFFER_SIZE 8384
+#define BUFFER_SIZE 8192
 #define PEEK_TIMEOUT 1
 #define MAX_STATUS 32
 #define MAX_BACKEND 32
