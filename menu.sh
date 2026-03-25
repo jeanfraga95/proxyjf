@@ -19,7 +19,7 @@ is_port_in_use() {
 # Função para abrir uma porta de proxy
 add_proxy_port() {
     local port=$1
-    local status=${2:-"Metodo Backend"}
+    local status=${2:-"Metodo_Backend"}
 
     if is_port_in_use $port; then
         echo "A porta $port já está em uso."
