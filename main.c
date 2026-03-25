@@ -124,7 +124,11 @@ void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        read(client_sock, buf, BUFFER_SIZE);  // Consume the request
+        int received = recv(client_sock, buf, BUFFER_SIZE, 0); // sem bloquear indevidamente
+if (received <= 0) {
+    close(client_sock);
+    return;
+}
 
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
