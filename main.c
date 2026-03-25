@@ -139,9 +139,10 @@ if (received <= 0) {
         // Already consumed with read above
     } else {
         // Need to consume the request now
-        int received = recv(client_sock, buf, int available = peek_data(client_sock, buf, sizeof(buf)-1);
-if (available > 0) {
-    recv(client_sock, buf, available, 0);
+        int received = recv(client_sock, buf, BUFFER_SIZE, 0); // sem bloquear indevidamente
+if (received <= 0) {
+    close(client_sock);
+    return;
 }
     }
 
