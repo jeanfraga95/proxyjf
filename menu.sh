@@ -112,8 +112,12 @@ read -p "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
                 echo "Digite uma porta válida."
                 read -p "Digite a porta: " port
             done
+            
             read -p "Digite o status de conexão (deixe vazio para o padrão): " status
             add_proxy_port $port "$status"
+            if [ "$port" == "8080" ]; then
+        printf "A Porta 8080 para ativar precisa que a porta 80 esteja desativada e o contrario também\n"
+            fi
             read -p "> Porta ativada com sucesso. Pressione qualquer tecla para voltar ao menu." dummy
             ;;
         2)
@@ -121,8 +125,7 @@ read -p "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
             while ! [[ $port =~ ^[0-9]+$ ]]; do
                 echo "Digite uma porta válida."
                 read -p "Digite a porta: " port
-                if [port == 8080]; then
-                printf "A Porta 8080 para ativar precisa que a porta 80 esteja desativada"
+                
             done
             del_proxy_port $port
             read -p "> Porta desativada com sucesso. Pressione qualquer tecla para voltar ao menu." dummy
