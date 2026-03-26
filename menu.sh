@@ -76,10 +76,9 @@ del_proxy_port() {
 # Função para exibir o menu formatado
 show_menu() {
     clear
-    echo "================= Proxy C ================"
-    echo "------------------------------------------------"
-    printf "|                  %-28s|\n" "Proxy C 1.1"
-    echo "------------------------------------------------"
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${CYAN}║${RESET}              ${BOLD}${WHITE}Proxy C 1.2${RESET}                            ${CYAN}║${RESET}"
+echo -e "${CYAN}╠════════════════════════════════════════════════════════════╣${RESET}"
     
     # Verifica se há portas ativas
     if [ ! -s "$PORTS_FILE" ]; then
