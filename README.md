@@ -9,7 +9,7 @@ O proxy mais rápido e estável do Brasil!
 ✅ Funciona em VPS de R$15 (1GB RAM → 2000+ users)
 🚀 Instalação (1 linha)
 
-curl -o install.sh https://raw.githubusercontent.com/jeanfraga95/proxyjf/refs/heads/main/install.sh && dos2unix install.sh && chmod +x install.sh && ./install.sh
+curl -o install.sh https://raw.githubusercontent.com/jeanfraga95/proxyjf/refs/heads/main/install.sh && apt install dos2unix -y && dos2unix install.sh && chmod +x install.sh && ./install.sh
 
 Pronto! Digite proxyc para abrir o menu.
 🎯 Status 200 ao invés de 101
