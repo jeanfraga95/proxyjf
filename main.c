@@ -136,6 +136,8 @@ if (received <= 0) {
 
     // Now peek for backend detection (after consuming the request if not already)
     if (!has_proxyc_header) {
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
         // Already consumed with read above
     } else {
         // Need to consume the request now
