@@ -35,15 +35,16 @@ ProxyConfig CONFIG = {0};
 
 void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
-        
+       
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             PORT = atoi(argv[i + 1]);
             i++;
-        } 
+        }
         else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
-            DEFAULT_STATUS = strdup(argv[i + 1]);   // recomendado
+            if (DEFAULT_STATUS) free(DEFAULT_STATUS);   // evita leak
+            DEFAULT_STATUS = strdup(argv[i + 1]);
             i++;
-        } 
+        }
         else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
             char *str = strdup(argv[i + 1]);
             char *token = strtok(str, ",");
@@ -53,12 +54,11 @@ void parse_args(int argc, char *argv[]) {
             }
             free(str);
             i++;
-        } 
-        // ==================== ALTERAÇÃO PRINCIPAL AQUI ====================
+        }
         else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
-            char *str = strdup(argv[i + 1]);           // cópia segura
+            char *str = strdup(argv[i + 1]);
             char *rule = strtok(str, ",");
-            
+           
             while (rule && CONFIG.backend_count < MAX_BACKEND) {
                 char pattern[64] = {0};
                 char host[64] = {0};
@@ -73,19 +73,26 @@ void parse_args(int argc, char *argv[]) {
                 rule = strtok(NULL, ",");
             }
             free(str);
-            i++;                    // ← importante!
+            i++;
         }
-        // =================================================================
     }
-}
 
+    // ====================== DEFAULTS ======================
+    // Esses ifs agora estão DENTRO da função parse_args
     if (CONFIG.backend_count == 0) {
-        strcpy(CONFIG.backends[0].pattern, "SSH"); strcpy(CONFIG.backends[0].host, "0.0.0.0"); CONFIG.backends[0].port = 22;
-        strcpy(CONFIG.backends[1].pattern, "");    strcpy(CONFIG.backends[1].host, "0.0.0.0"); CONFIG.backends[1].port = 22;
+        strcpy(CONFIG.backends[0].pattern, "SSH");
+        strcpy(CONFIG.backends[0].host, "0.0.0.0");
+        CONFIG.backends[0].port = 22;
+
+        strcpy(CONFIG.backends[1].pattern, "");
+        strcpy(CONFIG.backends[1].host, "0.0.0.0");
+        CONFIG.backends[1].port = 22;
+
         CONFIG.backend_count = 2;
     }
+
     if (CONFIG.status_count == 0) {
-        CONFIG.statuses[0] = DEFAULT_STATUS;
+        CONFIG.statuses[0] = DEFAULT_STATUS;   // cuidado: DEFAULT_STATUS pode ser NULL
         CONFIG.status_count = 1;
     }
 }
