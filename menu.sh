@@ -144,7 +144,7 @@ read -p "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
 
 
 
-# Verificar se o arquivo de portas existe, caso contrário, criar
+# Verificar se o arquivo de portas existe, caso contrário, criar 
 if [ ! -f "$PORTS_FILE" ]; then
     sudo touch "$PORTS_FILE"
 fi
