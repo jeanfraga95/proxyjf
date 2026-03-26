@@ -34,31 +34,40 @@ int PORT = 80;
 ProxyConfig CONFIG = {0};
 
 void parse_args(int argc, char *argv[]) {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            PORT = atoi(argv[i + 1]);
-        } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
-            DEFAULT_STATUS = argv[i + 1];
-        } else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
-            char *token = strtok(argv[i + 1], ",");
-            while (token && CONFIG.status_count < MAX_STATUS) {
-                CONFIG.statuses[CONFIG.status_count++] = strdup(token);
-                token = strtok(NULL, ",");
-            }
-        } else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
-            char *rule = strtok(argv[i + 1], ",");
-            while (rule && CONFIG.backend_count < MAX_BACKEND) {
-                char pattern[64], host[64];
-                int port;
-                if (sscanf(rule, "%63[^:]:%63[^:]:%d", pattern, host, &port) == 3) {
-                    strcpy(CONFIG.backends[CONFIG.backend_count].pattern, pattern);
-                    strcpy(CONFIG.backends[CONFIG.backend_count].host, host);
-                    CONFIG.backends[CONFIG.backend_count++].port = port;
-                }
-                rule = strtok(NULL, ",");
-            }
-        }
-    }
+    for (int i = 1; i < argc; i++) {
+
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            PORT = atoi(argv[i + 1]);
+        }
+        else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
+            DEFAULT_STATUS = argv[i + 1];
+        }
+        else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
+            char *token = strtok(argv[i + 1], ",");
+            while (token && CONFIG.status_count < MAX_STATUS) {
+                CONFIG.statuses[CONFIG.status_count++] = strdup(token);
+                token = strtok(NULL, ",");
+            }
+        }
+        else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
+            char *rule = strtok(argv[i + 1], ",");
+            while (rule && CONFIG.backend_count < MAX_BACKEND) {
+                char pattern[64];
+                char host[64];
+                int port;
+
+                if (sscanf(rule, "%63[^:]:%63[^:]:%d", pattern, host, &port) == 3) {
+                    strcpy(CONFIG.backends[CONFIG.backend_count].pattern, pattern);
+                    strcpy(CONFIG.backends[CONFIG.backend_count].host, host);
+                    CONFIG.backends[CONFIG.backend_count].port = port;
+                    CONFIG.backend_count++;
+                }
+
+                rule = strtok(NULL, ",");
+            }
+        }
+    }
+}
 
     if (CONFIG.backend_count == 0) {
         strcpy(CONFIG.backends[0].pattern, "SSH");
