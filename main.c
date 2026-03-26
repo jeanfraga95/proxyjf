@@ -34,32 +34,52 @@ int PORT = 80;
 ProxyConfig CONFIG = {0};
 
 void parse_args(int argc, char *argv[]) {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            PORT = atoi(argv[i + 1]);
-        } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
-            DEFAULT_STATUS = argv[i + 1];
-        } else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
-            char *token = strtok(argv[i + 1], ",");
-            while (token && CONFIG.status_count < MAX_STATUS) {
-                CONFIG.statuses[CONFIG.status_count++] = strdup(token);
-                token = strtok(NULL, ",");
-            }
-        } else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
-            char *rule = strtok(argv[i + 1], ",");
-            while (rule && CONFIG.backend_count < MAX_BACKEND) {
-                char pattern[64], host[64];
-                int port;
-                if (sscanf(rule, "%63[^:]:%63[^:]:%d", pattern, host, &port) == 3) {
-                    strcpy(CONFIG.backends[CONFIG.backend_count].pattern, pattern);
-                    strcpy(CONFIG.backends[CONFIG.backend_count].host, host);
-                    CONFIG.backends[CONFIG.backend_count++].port = port;
-                }
-                rule = strtok(NULL, ",");
-            }
-        }
-    }
+    for (int i = 1; i < argc; i++) {
 
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            PORT = atoi(argv[i + 1]);
+            i++;
+        }
+        else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
+            DEFAULT_STATUS = strdup(argv[i + 1]);
+            i++;
+        }
+        else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
+            char *str = strdup(argv[i + 1]);
+            char *token = strtok(str, ",");
+
+            while (token && CONFIG.status_count < MAX_STATUS) {
+                CONFIG.statuses[CONFIG.status_count++] = strdup(token);
+                token = strtok(NULL, ",");
+            }
+
+            free(str);
+            i++;
+        }
+        else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
+            char *str = strdup(argv[i + 1]);
+            char *rule = strtok(str, ",");
+
+            while (rule && CONFIG.backend_count < MAX_BACKEND) {
+                char pattern[64] = {0};
+                char host[64] = {0};
+                int port = 0;
+
+                if (sscanf(rule, "%63[^:]:%63[^:]:%d", pattern, host, &port) == 3) {
+                    strncpy(CONFIG.backends[CONFIG.backend_count].pattern, pattern, 63);
+                    strncpy(CONFIG.backends[CONFIG.backend_count].host, host, 63);
+                    CONFIG.backends[CONFIG.backend_count].port = port;
+                    CONFIG.backend_count++;
+                }
+
+                rule = strtok(NULL, ",");
+            }
+
+            free(str);
+            i++;
+        }
+    }
+}
     // ====================== DEFAULTS ======================
     // Esses ifs agora estão DENTRO da função parse_args
     if (CONFIG.backend_count == 0) {
