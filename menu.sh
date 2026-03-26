@@ -19,7 +19,7 @@ is_port_in_use() {
 # Função para abrir uma porta de proxy
 add_proxy_port() {
     local port=$1
-    local status=${2:-"Metodo_Backend"}
+    local status=${2:-"C"}
 
     if is_port_in_use $port; then
         echo "A porta $port já está em uso."
@@ -95,11 +95,11 @@ echo -e "${CYAN}╠════════════════════�
 echo -e "${CYAN}║${RESET}              ${BOLD}${WHITE}MENU DE CONTROLE${RESET}                            ${CYAN}║${RESET}"
 echo -e "${CYAN}╠════════════════════════════════════════════════════════════╣${RESET}"
 
-printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "1" "Abrir Porta"
-printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "2" "Fechar Porta"
-printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "3" "Abrir Gerenciador"
-printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "4" "Ir para o Menu do script SSH"
-printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET} - %-48s ${CYAN}║${RESET}\n" "0" "Voltar ao menu anterior"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET}      - %-48s ${CYAN}║${RESET}\n" "1" "Abrir Porta"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET}      - %-48s ${CYAN}║${RESET}\n" "2" "Fechar Porta"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET}      - %-48s ${CYAN}║${RESET}\n" "3" "Abrir Gerenciador"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET}      - %-48s ${CYAN}║${RESET}\n" "4" "Ir para o Menu do script SSH"
+printf "${CYAN}║${RESET}  ${GREEN}%-2s${RESET}      - %-48s ${CYAN}║${RESET}\n" "0" "Voltar ao menu anterior"
 
 echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${RESET}"
 echo
@@ -121,6 +121,8 @@ read -p "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
             while ! [[ $port =~ ^[0-9]+$ ]]; do
                 echo "Digite uma porta válida."
                 read -p "Digite a porta: " port
+                if [port == 8080]; then
+                printf "A Porta 8080 para ativar precisa que a porta 80 esteja desativada"
             done
             del_proxy_port $port
             read -p "> Porta desativada com sucesso. Pressione qualquer tecla para voltar ao menu." dummy
