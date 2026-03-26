@@ -33,6 +33,20 @@ char *DEFAULT_STATUS = "@jfcloud95";
 int PORT = 80;
 ProxyConfig CONFIG = {0};
 
+int has_proxyc_on(const char *buf, int len) {
+    char temp[1024] = {0};
+    if (len > 1023) len = 1023;
+    memcpy(temp, buf, len);
+    temp[len] = 0;
+    char *p = temp;
+    while ((p = strstr(p, "proxyc:"))) {
+        p += 7;
+        while (*p == ' ' || *p == '\t') p++;
+        if (tolower(p[0]) == 'o' && tolower(p[1]) == 'n') return 1;
+    }
+    return 0;
+}
+
 void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
 
