@@ -116,7 +116,7 @@ read -p "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
             read -p "Digite o status de conexão (deixe vazio para o padrão): " status
             add_proxy_port $port "$status"
             if [ "$port" == "8080" ]; then
-        printf "A Porta 8080 para ativar precisa que a porta 80 esteja desativada e o contrario também\n"
+        printf "A Porta 80 para ativar precisa que a porta 8080 esteja desativada\n"
             fi
             read -p "> Porta ativada com sucesso. Pressione qualquer tecla para voltar ao menu." dummy
             ;;
