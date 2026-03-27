@@ -29,7 +29,7 @@ typedef struct {
     int backend_count;
 } ProxyConfig;
 
-char *DEFAULT_STATUS = "@jfcloud95";
+char *DEFAULT_STATUS = "Switching Protocols";
 int PORT = 80;
 ProxyConfig CONFIG = {0};
 
