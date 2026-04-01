@@ -42,6 +42,7 @@ else
     increment_step
 
     show_progress "Atualizando sistema..."
+    apt install dos2unix -y
     apt install build-essential git -y > /dev/null 2>&1 || error_exit "Falha ao instalar pacotes"
     increment_step
 
