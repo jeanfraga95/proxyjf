@@ -529,7 +529,7 @@ draw_menu() {
 
     # ── Cabeçalho ─────────────────────────────────────────────────────────
     printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"   # 0
-    printf "%s║%s  %s%s  Proxy C  %s%sv1.4%s                 %suptime: %-18s%s%s║%s\n" \
+    printf "%s║%s %s%s Proxy C  %s%sv1.4%s                 %suptime: %-18s%s%s║%s\n" \
         "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "$DIM" "$RESET" \
         "$DIM" "$up_time" "$RESET" "$CYAN" "$RESET"                                                   # 1
     printf "%s╠══════════════════════════════════════════════════════════════╣%s\n" "$CYAN" "$RESET"   # 2
@@ -564,9 +564,9 @@ draw_menu() {
         "$CYAN" "$RESET" "$GREEN"   "$RESET" "$WHITE" "$RESET" "$GREEN"   "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s3%s  %sReiniciar porta%s       %s4%s  %sAlterar status%s                 %s║%s\n" \
         "$CYAN" "$RESET" "$YELLOW"  "$RESET" "$WHITE" "$RESET" "$YELLOW"  "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s5%s  %sConexões por porta%s    %s6%s  %sPortas da máquina%s               %s║%s\n" \
+    printf "%s║%s   %s5%s  %sConexões por porta%s    %s6%s  %sPortas da máquina%s              %s║%s\n" \
         "$CYAN" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s7%s  %sAtualizar proxy%s       %s8%s  %sGerenciador (htop)%s              %s║%s\n" \
+    printf "%s║%s   %s7%s  %sAtualizar proxy%s       %s8%s  %sGerenciador(htop)%s              %s║%s\n" \
         "$CYAN" "$RESET" "$MAGENTA" "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s9%s  %sMenu SSH%s              %s0%s  %sSair%s                           %s║%s\n" \
         "$CYAN" "$RESET" "$CYAN"    "$RESET" "$WHITE" "$RESET" "$RED"     "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
