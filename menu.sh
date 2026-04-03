@@ -7,14 +7,15 @@
 
 PORTS_FILE="/opt/proxyc/ports"
 PROXY_BIN="/opt/proxyc/proxy"
-MENU_SELF="$0"   # caminho deste script (para auto-atualização)
+MENU_SELF="$0"
 
 REPO_OWNER="jeanfraga95"
 REPO_NAME="proxyjf"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents"
 RAW_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
+SHA_CACHE="/opt/proxyc/.last_sha_main_c"
 
-# ── Cores (sintaxe $'\e[' — funciona em printf/read sem -e) ───
+# ── Cores ─────────────────────────────────────────────────────
 RED=$'\e[0;31m'
 GREEN=$'\e[0;32m'
 YELLOW=$'\e[1;33m'
@@ -25,6 +26,15 @@ MAGENTA=$'\e[0;35m'
 BOLD=$'\e[1m'
 DIM=$'\e[2m'
 RESET=$'\e[0m'
+
+# Sequências de cursor
+CURSOR_HIDE=$'\e[?25l'
+CURSOR_SHOW=$'\e[?25h'
+CURSOR_HOME=$'\e[H'
+CLEAR_SCREEN=$'\e[2J'
+
+# ── Trap: garantir que o cursor volte ao sair ─────────────────
+trap "printf '%s' '${CURSOR_SHOW}'; tput cnorm 2>/dev/null; exit" INT TERM EXIT
 
 # ═══════════════════════════════════════════════════════════════
 #  Utilitários de sistema
@@ -37,12 +47,12 @@ get_cpu_usage() {
     printf "%.0f" "${cpu:-0}"
 }
 
-get_mem_usage() {
-    local total used pct
-    read -r total used <<< "$(free -m | awk 'NR==2{print $2, $3}')"
-    [ -z "$total" ] || [ "$total" -eq 0 ] && { echo "0% (0/0 MB)"; return; }
-    pct=$(( used * 100 / total ))
-    echo "${pct}% (${used}/${total} MB)"
+get_mem_pct() {
+    free -m | awk 'NR==2{ if($2>0) printf "%.0f", $3*100/$2; else print "0" }'
+}
+
+get_mem_info() {
+    free -m | awk 'NR==2{ printf "%d%%% (%d/%d MB)", $3*100/$2, $3, $2 }'
 }
 
 get_color_bar() {
@@ -61,15 +71,61 @@ get_color_bar() {
     printf "%s%s%s" "$color" "$bar" "$RESET"
 }
 
-get_mem_bar() {
-    local pct
-    pct=$(free -m | awk 'NR==2{printf "%.0f", $3*100/$2}')
-    get_color_bar "$pct"
-}
-
 get_uptime() {
     uptime -p 2>/dev/null | sed 's/up //' \
         || uptime | awk -F',' '{print $1}' | awk '{print $3,$4}'
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Cabeçalho com CPU/MEM ao vivo (atualiza sem redesenhar o menu)
+#  Usa tput cup para mover o cursor para as linhas corretas.
+# ═══════════════════════════════════════════════════════════════
+
+# Linha (0-based) onde começa o bloco CPU/MEM no menu
+CPU_LINE=3   # linha da barra de CPU
+MEM_LINE=4   # linha da barra de MEM
+
+_live_header_pid=""
+
+start_live_header() {
+    stop_live_header   # garante que não há loop anterior
+
+    (
+        while true; do
+            local cpu_pct mem_pct mem_info cpu_bar mem_bar
+            cpu_pct=$(get_cpu_usage)
+            mem_pct=$(get_mem_pct)
+            mem_info=$(get_mem_info)
+            cpu_bar=$(get_color_bar "$cpu_pct")
+            mem_bar=$(get_color_bar "$mem_pct")
+
+            # Salva posição, move para linha CPU, escreve, restaura
+            printf "\0337"   # salva cursor (ESC 7)
+
+            # Linha CPU
+            tput cup $CPU_LINE 0 2>/dev/null
+            printf "%s║%s  %sCPU%s  %s  %3s%%                              %s║%s" \
+                "$CYAN" "$RESET" "$DIM" "$RESET" "$cpu_bar" "$cpu_pct" "$CYAN" "$RESET"
+
+            # Linha MEM
+            tput cup $MEM_LINE 0 2>/dev/null
+            printf "%s║%s  %sMEM%s  %s  %-20s            %s║%s" \
+                "$CYAN" "$RESET" "$DIM" "$RESET" "$mem_bar" "$mem_info" "$CYAN" "$RESET"
+
+            printf "\0338"   # restaura cursor (ESC 8)
+
+            sleep 2
+        done
+    ) &
+    _live_header_pid=$!
+}
+
+stop_live_header() {
+    if [ -n "$_live_header_pid" ] && kill -0 "$_live_header_pid" 2>/dev/null; then
+        kill "$_live_header_pid" 2>/dev/null
+        wait "$_live_header_pid" 2>/dev/null
+    fi
+    _live_header_pid=""
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,8 +140,7 @@ is_port_in_use() {
 }
 
 get_port_status_symbol() {
-    local port=$1
-    if sudo systemctl is-active --quiet "proxyc${port}.service" 2>/dev/null; then
+    if sudo systemctl is-active --quiet "proxyc${1}.service" 2>/dev/null; then
         printf "%s●%s" "$GREEN" "$RESET"
     else
         printf "%s●%s" "$RED" "$RESET"
@@ -148,19 +203,20 @@ restart_proxy_port() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Conexões ativas por porta
+#  Conexões ativas por porta  (bug count corrigido)
 # ═══════════════════════════════════════════════════════════════
 
 show_connections() {
+    stop_live_header
     clear
+
     printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
-    printf "%s║%s  %s%s  Conexões Ativas%s%52s%s║%s\n" \
+    printf "%s║%s  %s%s  Conexões Ativas%s%45s%s║%s\n" \
         "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "" "$CYAN" "$RESET"
-    printf "%s╚══════════════════════════════════════════════════════════════╝%s\n" "$CYAN" "$RESET"
-    echo
+    printf "%s╚══════════════════════════════════════════════════════════════╝%s\n\n" "$CYAN" "$RESET"
 
     if [ ! -s "$PORTS_FILE" ]; then
-        echo "${YELLOW}  Nenhuma porta aberta.${RESET}"
+        echo "  ${YELLOW}Nenhuma porta aberta.${RESET}"
         echo
         pause
         return
@@ -169,36 +225,38 @@ show_connections() {
     local total_conn=0
 
     while read -r port; do
-        # Busca conexões ESTABLISHED na porta (local ou remota)
-        # ss -tn mostra: State, Recv-Q, Send-Q, Local, Peer
-        local conns
-        conns=$(ss -tn state established 2>/dev/null \
-                | awk -v p=":${port}" '$4 ~ p || $5 ~ p {print $5}' \
-                | sed 's/:[0-9]*$//' \
-                | sort -u)
+        # Lista IPs remotos com conexão ESTABLISHED nessa porta
+        local conns_raw
+        conns_raw=$(ss -tn state established 2>/dev/null \
+            | awk -v p=":${port}" '($4 ~ p) || ($5 ~ p) { print $5 }' \
+            | sed 's/:[0-9]*$//' \
+            | grep -v '^$' \
+            | sort -u)
 
-        local count
-        count=$(echo "$conns" | grep -c '\S' 2>/dev/null || echo 0)
+        # Contagem segura: se vazio → 0
+        local count=0
+        if [ -n "$conns_raw" ]; then
+            count=$(printf '%s\n' "$conns_raw" | grep -c '.')
+        fi
+
         total_conn=$(( total_conn + count ))
 
         local sym
         sym=$(get_port_status_symbol "$port")
 
-        printf "  %s  %s%-6s%s  %s%d usuário(s)%s\n" \
-            "$sym" "$WHITE" "[$port]" "$RESET" "$CYAN" "$count" "$RESET"
+        printf "  %s  %s[%-6s]%s  %s%d usuário(s) conectado(s)%s\n" \
+            "$sym" "$WHITE" "$port" "$RESET" "$CYAN" "$count" "$RESET"
 
-        if [ -n "$conns" ] && [ "$count" -gt 0 ]; then
+        if [ "$count" -gt 0 ]; then
             while IFS= read -r ip; do
                 [ -z "$ip" ] && continue
-                # Tenta resolver hostname (sem bloquear muito tempo)
-                local host
-                host=$(timeout 1 host "$ip" 2>/dev/null \
-                       | awk '/domain name pointer/{print $NF; exit}' \
-                       | sed 's/\.$//')
-                [ -z "$host" ] && host="$ip"
-                printf "       %s→%s  %-20s  %s(%s)%s\n" \
-                    "$DIM" "$RESET" "$ip" "$DIM" "$host" "$RESET"
-            done <<< "$conns"
+                local resolved
+                resolved=$(timeout 1 host "$ip" 2>/dev/null \
+                    | awk '/domain name pointer/{gsub(/\.$/,"",$NF); print $NF; exit}')
+                [ -z "$resolved" ] && resolved="$ip"
+                printf "       %s→  %-18s%s  %s%s%s\n" \
+                    "$DIM" "$ip" "$RESET" "$DIM" "$resolved" "$RESET"
+            done <<< "$conns_raw"
         fi
         echo
     done < "$PORTS_FILE"
@@ -208,178 +266,117 @@ show_connections() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Verificação e atualização via GitHub API
+#  Verificação e atualização silenciosa via GitHub API
 # ═══════════════════════════════════════════════════════════════
 
-# Retorna o SHA do arquivo no repositório remoto (GitHub API)
 github_sha() {
-    local filepath=$1   # ex: "main.c" ou "menu.sh"
-    local url="${GITHUB_API}/${filepath}"
-    local sha
-
-    sha=$(curl -sf "$url" \
-          -H "Accept: application/vnd.github.v3+json" \
-          | grep '"sha"' | head -1 | awk -F'"' '{print $4}')
-    echo "$sha"
+    curl -sf "${GITHUB_API}/${1}" \
+         -H "Accept: application/vnd.github.v3+json" \
+    | grep '"sha"' | head -1 | awk -F'"' '{print $4}'
 }
 
-# Calcula SHA-1 Git de um arquivo local (mesmo algoritmo que o GitHub usa)
-# Git usa: "blob <tamanho>\0<conteúdo>" como entrada do sha1
 local_git_sha() {
     local file=$1
     [ ! -f "$file" ] && { echo ""; return; }
-    local size content hash
+    local size
     size=$(wc -c < "$file")
-    # printf para incluir o byte nulo corretamente
     { printf "blob %s\0" "$size"; cat "$file"; } | sha1sum | awk '{print $1}'
 }
 
 check_and_update() {
+    stop_live_header
     clear
+
     printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
     printf "%s║%s  %s%s  Verificar / Atualizar Proxy%s%32s%s║%s\n" \
         "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "" "$CYAN" "$RESET"
     printf "%s╚══════════════════════════════════════════════════════════════╝%s\n\n" "$CYAN" "$RESET"
 
-    # Verificar dependência
     if ! command -v curl &>/dev/null; then
         echo "${RED}  ✗  curl não encontrado. Instale com: apt install curl${RESET}"
-        echo
-        pause
-        return
+        echo; pause; return
     fi
 
     echo "  ${DIM}Consultando repositório...${RESET}"
-    echo
 
-    # ── Verificar main.c (binário do proxy) ───────────────────────────────
-    local remote_sha_c local_sha_c
-    remote_sha_c=$(github_sha "main.c")
-    local_sha_c=$(local_git_sha "$PROXY_BIN.c" 2>/dev/null)
-    # Fallback: compara SHA do binário compilado (não é o mesmo, mas serve
-    # como indicador de versão se guardarmos o SHA da última compilação)
-    local sha_cache="/opt/proxyc/.last_sha_main_c"
-    local cached_sha_c=""
-    [ -f "$sha_cache" ] && cached_sha_c=$(cat "$sha_cache")
+    # ── SHAs remotos ──────────────────────────────────────────────────────
+    local remote_c remote_menu
+    remote_c=$(github_sha "main.c")
+    remote_menu=$(github_sha "menu.sh")
 
-    # ── Verificar menu.sh ─────────────────────────────────────────────────
-    local remote_sha_menu local_sha_menu
-    remote_sha_menu=$(github_sha "menu.sh")
-    local_sha_menu=$(local_git_sha "$MENU_SELF")
+    # ── SHAs locais ───────────────────────────────────────────────────────
+    local cached_c=""
+    [ -f "$SHA_CACHE" ] && cached_c=$(cat "$SHA_CACHE")
+    local local_menu
+    local_menu=$(local_git_sha "$MENU_SELF")
 
-    # ── Exibir resultado ──────────────────────────────────────────────────
+    # ── Decidir o que atualizar ───────────────────────────────────────────
     local update_proxy=0 update_menu=0
 
-    # Proxy (main.c → binário compilado)
-    if [ -z "$remote_sha_c" ]; then
-        printf "  %s●%s  proxy (main.c)   %s✗ sem conexão com GitHub%s\n" "$RED" "$RESET" "$RED" "$RESET"
-    elif [ -z "$cached_sha_c" ] || [ "$remote_sha_c" != "$cached_sha_c" ]; then
-        printf "  %s●%s  proxy (main.c)   %s⬆  atualização disponível%s\n" "$YELLOW" "$RESET" "$YELLOW" "$RESET"
-        printf "       remoto: %s%.12s%s\n" "$DIM" "$remote_sha_c" "$RESET"
-        printf "       local : %s%.12s%s\n\n" "$DIM" "${cached_sha_c:-"(nunca compilado)"}""$RESET"
-        update_proxy=1
-    else
-        printf "  %s●%s  proxy (main.c)   %s✔  já está atualizado%s\n" "$GREEN" "$RESET" "$GREEN" "$RESET"
-        printf "       sha: %s%.12s%s\n\n" "$DIM" "$remote_sha_c" "$RESET"
-    fi
+    [ -n "$remote_c" ]    && [ "$remote_c"    != "$cached_c"    ] && update_proxy=1
+    [ -n "$remote_menu" ] && [ "$remote_menu" != "$local_menu"  ] && update_menu=1
 
-    # Menu (menu.sh)
-    if [ -z "$remote_sha_menu" ]; then
-        printf "  %s●%s  menu.sh          %s✗ sem conexão com GitHub%s\n\n" "$RED" "$RESET" "$RED" "$RESET"
-    elif [ "$remote_sha_menu" != "$local_sha_menu" ]; then
-        printf "  %s●%s  menu.sh          %s⬆  atualização disponível%s\n" "$YELLOW" "$RESET" "$YELLOW" "$RESET"
-        printf "       remoto: %s%.12s%s\n" "$DIM" "$remote_sha_menu" "$RESET"
-        printf "       local : %s%.12s%s\n\n" "$DIM" "$local_sha_menu" "$RESET"
-        update_menu=1
-    else
-        printf "  %s●%s  menu.sh          %s✔  já está atualizado%s\n\n" "$GREEN" "$RESET" "$GREEN" "$RESET"
-        printf "       sha: %s%.12s%s\n\n" "$DIM" "$remote_sha_menu" "$RESET"
-    fi
-
-    # ── Nada para atualizar ───────────────────────────────────────────────
     if [ "$update_proxy" -eq 0 ] && [ "$update_menu" -eq 0 ]; then
-        echo "  ${GREEN}Tudo atualizado.${RESET}"
-        echo
+        printf "\r  %s✔  Tudo atualizado.%s\n\n" "$GREEN" "$RESET"
         pause
         return
     fi
 
-    # ── Perguntar se deseja atualizar ─────────────────────────────────────
-    prompt "  ${YELLOW}Deseja instalar as atualizações disponíveis? [s/N]:${RESET} " confirm
-    [ "${confirm,,}" != "s" ] && { echo; pause; return; }
-    echo
-
     # ── Atualizar proxy (compilar main.c) ─────────────────────────────────
     if [ "$update_proxy" -eq 1 ]; then
-        echo "  ${CYAN}▶ Baixando main.c...${RESET}"
+        printf "\r  ${CYAN}▶ Atualizando proxy...${RESET}  "
 
-        local tmp_c
+        local tmp_c tmp_bin
         tmp_c=$(mktemp /tmp/proxyjf_main_XXXX.c)
+        tmp_bin=$(mktemp /tmp/proxyjf_bin_XXXX)
 
-        if ! curl -sf "${RAW_URL}/main.c" -o "$tmp_c"; then
-            echo "  ${RED}✗  Falha ao baixar main.c${RESET}"
-        else
-            echo "  ${CYAN}▶ Compilando...${RESET}"
+        if curl -sf "${RAW_URL}/main.c" -o "$tmp_c" \
+           && gcc -O2 -pthread "$tmp_c" -o "$tmp_bin" 2>/dev/null; then
 
-            local tmp_bin
-            tmp_bin=$(mktemp /tmp/proxyjf_bin_XXXX)
+            sudo cp "$tmp_bin" "$PROXY_BIN"
+            sudo chmod +x "$PROXY_BIN"
+            sudo mkdir -p /opt/proxyc
+            echo "$remote_c" | sudo tee "$SHA_CACHE" > /dev/null
 
-            if gcc -O2 -pthread "$tmp_c" -o "$tmp_bin" 2>/tmp/proxyjf_gcc_err.txt; then
-                sudo cp "$tmp_bin" "$PROXY_BIN"
-                sudo chmod +x "$PROXY_BIN"
-
-                # Salvar SHA para referência futura
-                sudo mkdir -p /opt/proxyc
-                echo "$remote_sha_c" | sudo tee "$sha_cache" > /dev/null
-
-                # Reiniciar todos os serviços do proxy
-                echo "  ${CYAN}▶ Reiniciando serviços...${RESET}"
+            # Reinicia todos os serviços silenciosamente
+            if [ -s "$PORTS_FILE" ]; then
                 while read -r port; do
-                    sudo systemctl restart "proxyc${port}.service" 2>/dev/null \
-                        && printf "    %s✔%s porta %s reiniciada\n" "$GREEN" "$RESET" "$port" \
-                        || printf "    %s✗%s porta %s falhou\n"     "$RED"   "$RESET" "$port"
+                    sudo systemctl restart "proxyc${port}.service" 2>/dev/null
                 done < "$PORTS_FILE"
-
-                echo "  ${GREEN}✔  Proxy atualizado com sucesso.${RESET}"
-            else
-                echo "  ${RED}✗  Falha na compilação:${RESET}"
-                cat /tmp/proxyjf_gcc_err.txt | head -20 | sed 's/^/     /'
             fi
 
-            rm -f "$tmp_bin" /tmp/proxyjf_gcc_err.txt
+            printf "%s✔%s\n" "$GREEN" "$RESET"
+        else
+            printf "%s✗%s\n" "$RED" "$RESET"
         fi
 
-        rm -f "$tmp_c"
-        echo
+        rm -f "$tmp_c" "$tmp_bin"
     fi
 
     # ── Atualizar menu.sh ─────────────────────────────────────────────────
     if [ "$update_menu" -eq 1 ]; then
-        echo "  ${CYAN}▶ Baixando menu.sh...${RESET}"
+        printf "  ${CYAN}▶ Atualizando menu...${RESET}    "
 
         local tmp_menu
         tmp_menu=$(mktemp /tmp/proxyjf_menu_XXXX.sh)
 
-        if ! curl -sf "${RAW_URL}/menu.sh" -o "$tmp_menu"; then
-            echo "  ${RED}✗  Falha ao baixar menu.sh${RESET}"
+        if curl -sf "${RAW_URL}/menu.sh" -o "$tmp_menu" \
+           && grep -q "#!/bin/bash" "$tmp_menu"; then
+
+            sudo cp "$tmp_menu" "$MENU_SELF"
+            sudo chmod +x "$MENU_SELF"
             rm -f "$tmp_menu"
+
+            printf "%s✔%s\n\n" "$GREEN" "$RESET"
+            sleep 1
+            exec "$MENU_SELF"   # relança com a nova versão
         else
-            # Validação básica antes de sobrescrever
-            if grep -q "#!/bin/bash" "$tmp_menu"; then
-                sudo cp "$tmp_menu" "$MENU_SELF"
-                sudo chmod +x "$MENU_SELF"
-                echo "  ${GREEN}✔  Menu atualizado. Reiniciando...${RESET}"
-                rm -f "$tmp_menu"
-                sleep 1
-                exec "$MENU_SELF"   # relança com a nova versão
-            else
-                echo "  ${RED}✗  Arquivo baixado parece inválido. Atualização cancelada.${RESET}"
-                rm -f "$tmp_menu"
-            fi
+            printf "%s✗%s\n" "$RED" "$RESET"
+            rm -f "$tmp_menu"
         fi
-        echo
     fi
 
+    echo
     pause
 }
 
@@ -398,28 +395,31 @@ pause() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Menu principal
+#  Desenha o menu (uma vez) e inicia o loop de CPU/MEM ao vivo
 # ═══════════════════════════════════════════════════════════════
 
-show_menu() {
-    clear
-
-    local cpu_pct mem_info up_time cpu_bar mem_bar
-    cpu_pct=$(get_cpu_usage)
-    mem_info=$(get_mem_usage)
+draw_menu() {
+    local up_time cpu_pct mem_pct mem_info cpu_bar mem_bar
     up_time=$(get_uptime)
+    cpu_pct=$(get_cpu_usage)
+    mem_pct=$(get_mem_pct)
+    mem_info=$(get_mem_info)
     cpu_bar=$(get_color_bar "$cpu_pct")
-    mem_bar=$(get_mem_bar)
+    mem_bar=$(get_color_bar "$mem_pct")
 
     # ── Cabeçalho ─────────────────────────────────────────────────────────
-    printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
+    printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"   # 0
     printf "%s║%s  %s%s  Proxy C  %s%sv1.4%s                 %suptime: %-18s%s%s║%s\n" \
-        "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "$DIM" "$RESET" "$DIM" "$up_time" "$RESET" "$CYAN" "$RESET"
-    printf "%s╠══════════════════════════════════════════════════════════════╣%s\n" "$CYAN" "$RESET"
+        "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "$DIM" "$RESET" \
+        "$DIM" "$up_time" "$RESET" "$CYAN" "$RESET"                                                   # 1
+    printf "%s╠══════════════════════════════════════════════════════════════╣%s\n" "$CYAN" "$RESET"   # 2
 
-    printf "%s║%s  %sCPU%s  %s  %3s%%   %s║%s\n" \
+    # linha 3 — CPU (atualizada pelo loop ao vivo)
+    printf "%s║%s  %sCPU%s  %s  %3s%%                              %s║%s\n" \
         "$CYAN" "$RESET" "$DIM" "$RESET" "$cpu_bar" "$cpu_pct" "$CYAN" "$RESET"
-    printf "%s║%s  %sMEM%s  %s  %-20s%s║%s\n" \
+
+    # linha 4 — MEM (atualizada pelo loop ao vivo)
+    printf "%s║%s  %sMEM%s  %s  %-20s            %s║%s\n" \
         "$CYAN" "$RESET" "$DIM" "$RESET" "$mem_bar" "$mem_info" "$CYAN" "$RESET"
 
     # ── Portas ativas ─────────────────────────────────────────────────────
@@ -444,20 +444,35 @@ show_menu() {
         "$CYAN" "$RESET" "$GREEN"   "$RESET" "$WHITE" "$RESET" "$GREEN"   "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s3%s  %sReiniciar porta%s       %s4%s  %sConexões por porta%s              %s║%s\n" \
         "$CYAN" "$RESET" "$YELLOW"  "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s5%s  %sVerificar atualizações%s %s6%s  %sGerenciador (htop)%s              %s║%s\n" \
+    printf "%s║%s   %s5%s  %sAtualizar proxy%s       %s6%s  %sGerenciador (htop)%s              %s║%s\n" \
         "$CYAN" "$RESET" "$MAGENTA" "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s7%s  %sMenu SSH%s              %s0%s  %sSair%s                           %s║%s\n" \
         "$CYAN" "$RESET" "$CYAN"    "$RESET" "$WHITE" "$RESET" "$RED"     "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s                                                              %s║%s\n" "$CYAN" "$RESET" "$CYAN" "$RESET"
     printf "%s╚══════════════════════════════════════════════════════════════╝%s\n" "$CYAN" "$RESET"
     echo
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Loop principal
+# ═══════════════════════════════════════════════════════════════
+
+show_menu() {
+    stop_live_header
+    clear
+    printf "%s" "$CURSOR_HIDE"
+    draw_menu
+    printf "%s" "$CURSOR_SHOW"
+    start_live_header
 
     prompt "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
 
+    stop_live_header
+
     case $option in
 
-        # ── Abrir porta ───────────────────────────────────────────────────
-        1)
+        1)  # Abrir porta
+            clear
             echo
             prompt "  ${CYAN}Porta:${RESET} " port
             while ! [[ $port =~ ^[0-9]+$ ]]; do
@@ -466,13 +481,14 @@ show_menu() {
             done
             prompt "  ${CYAN}Status de conexão (vazio = padrão):${RESET} " status
             add_proxy_port "$port" "$status"
-            [ "$port" == "8080" ] && echo "${YELLOW}  ⚠  A porta 80 requer que a 8080 esteja desativada.${RESET}"
+            [ "$port" == "8080" ] && \
+                echo "${YELLOW}  ⚠  A porta 80 requer que a 8080 esteja desativada.${RESET}"
             echo "${GREEN}  ✔  Porta ${port} ativada com sucesso.${RESET}"
             pause
             ;;
 
-        # ── Fechar porta ──────────────────────────────────────────────────
-        2)
+        2)  # Fechar porta
+            clear
             echo
             prompt "  ${CYAN}Porta:${RESET} " port
             while ! [[ $port =~ ^[0-9]+$ ]]; do
@@ -484,8 +500,8 @@ show_menu() {
             pause
             ;;
 
-        # ── Reiniciar porta ───────────────────────────────────────────────
-        3)
+        3)  # Reiniciar porta
+            clear
             echo
             if [ ! -s "$PORTS_FILE" ]; then
                 echo "${YELLOW}  ⚠  Nenhuma porta ativa para reiniciar.${RESET}"
@@ -494,7 +510,8 @@ show_menu() {
             fi
             echo "  ${DIM}Portas abertas:${RESET}"
             while read -r p; do
-                printf "    %s  %s%s%s\n" "$(get_port_status_symbol "$p")" "$WHITE" "$p" "$RESET"
+                printf "    %s  %s%s%s\n" \
+                    "$(get_port_status_symbol "$p")" "$WHITE" "$p" "$RESET"
             done < "$PORTS_FILE"
             echo
             prompt "  ${CYAN}Porta para reiniciar:${RESET} " port
@@ -508,29 +525,24 @@ show_menu() {
             pause
             ;;
 
-        # ── Conexões por porta ────────────────────────────────────────────
-        4)
+        4)  # Conexões por porta
             show_connections
             ;;
 
-        # ── Verificar/atualizar ───────────────────────────────────────────
-        5)
+        5)  # Atualizar
             check_and_update
             ;;
 
-        # ── Gerenciador ───────────────────────────────────────────────────
-        6)
+        6)  # htop
             htop
             ;;
 
-        # ── Menu SSH ──────────────────────────────────────────────────────
-        7)
+        7)  # Menu SSH
             menu
             ;;
 
-        # ── Sair ──────────────────────────────────────────────────────────
-        0)
-            echo "${DIM}  Saindo...${RESET}"
+        0)  # Sair
+            clear
             exit 0
             ;;
 
