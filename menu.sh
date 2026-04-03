@@ -52,7 +52,7 @@ get_mem_pct() {
 }
 
 get_mem_info() {
-    free -m | awk 'NR==2{ printf "%d%%% (%d/%d MB)", $3*100/$2, $3, $2 }'
+    free -m | awk 'NR==2{ printf "%d%% (%d/%d MB)", $3*100/$2, $3, $2 }'
 }
 
 get_color_bar() {
@@ -200,6 +200,118 @@ restart_proxy_port() {
         return 1
     fi
     sudo systemctl restart "proxyc${port}.service"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Todas as portas abertas na máquina + serviço
+# ═══════════════════════════════════════════════════════════════
+
+show_open_ports() {
+    stop_live_header
+    clear
+
+    printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
+    printf "%s║%s  %s%s  Portas Abertas na Máquina%s%34s%s║%s\n" \
+        "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "" "$CYAN" "$RESET"
+    printf "%s╚══════════════════════════════════════════════════════════════╝%s\n\n" "$CYAN" "$RESET"
+
+    printf "  %s%-8s %-12s %-20s %s%s\n" "$DIM" "PORTA" "PROTO" "ENDEREÇO" "SERVIÇO/PROCESSO" "$RESET"
+    printf "  %s%s%s\n\n" "$DIM" "──────────────────────────────────────────────────────────" "$RESET"
+
+    # ss lista todas as portas em LISTEN — TCP e UDP
+    while IFS= read -r line; do
+        local proto laddr pid_info port svc addr
+
+        proto=$(awk '{print $1}' <<< "$line")
+        laddr=$(awk '{print $5}' <<< "$line")
+        pid_info=$(grep -oP 'pid=\K[0-9]+' <<< "$line" | head -1)
+
+        port=$(rev <<< "$laddr" | cut -d: -f1 | rev)
+        addr=$(rev <<< "$laddr" | cut -d: -f2- | rev)
+        [ "$addr" = "*" ] || [ -z "$addr" ] && addr="0.0.0.0"
+
+        if [ -n "$pid_info" ]; then
+            svc=$(ps -p "$pid_info" -o comm= 2>/dev/null | head -1)
+        else
+            svc=$(awk -v p="$port" '$2 ~ "^"p"/" {print $1; exit}' /etc/services 2>/dev/null)
+            [ -z "$svc" ] && svc="-"
+        fi
+
+        local color="$RESET"
+        grep -q "^${port}$" "$PORTS_FILE" 2>/dev/null && color="$GREEN"
+
+        printf "  %s%-8s %-12s %-20s %s%s\n" \
+            "$color" "$port" "$proto" "$addr" "$svc" "$RESET"
+
+    done < <(ss -tlnup 2>/dev/null | awk 'NR>1' | sort -t: -k2 -n)
+
+    echo
+    pause
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Alterar status de uma porta sem fechar/reabrir
+# ═══════════════════════════════════════════════════════════════
+
+change_port_status() {
+    stop_live_header
+    clear
+
+    printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
+    printf "%s║%s  %s%s  Alterar Status da Porta%s%36s%s║%s\n" \
+        "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "" "$CYAN" "$RESET"
+    printf "%s╚══════════════════════════════════════════════════════════════╝%s\n\n" "$CYAN" "$RESET"
+
+    if [ ! -s "$PORTS_FILE" ]; then
+        echo "  ${YELLOW}Nenhuma porta aberta.${RESET}"
+        echo; pause; return
+    fi
+
+    echo "  ${DIM}Portas abertas:${RESET}"
+    while read -r p; do
+        local svc_file="/etc/systemd/system/proxyc${p}.service"
+        local cur_status=""
+        if [ -f "$svc_file" ]; then
+            cur_status=$(grep 'ExecStart=' "$svc_file" | grep -oP '--status \K\S+')
+        fi
+        [ -z "$cur_status" ] && cur_status="(padrão)"
+        printf "    %s  %s%-6s%s  status: %s%s%s\n" \
+            "$(get_port_status_symbol "$p")" \
+            "$WHITE" "$p" "$RESET" \
+            "$YELLOW" "$cur_status" "$RESET"
+    done < "$PORTS_FILE"
+    echo
+
+    prompt "  ${CYAN}Porta para alterar:${RESET} " port
+    while ! [[ $port =~ ^[0-9]+$ ]]; do
+        echo "${RED}  Porta inválida.${RESET}"
+        prompt "  ${CYAN}Porta:${RESET} " port
+    done
+
+    if ! grep -q "^${port}$" "$PORTS_FILE" 2>/dev/null; then
+        echo "${RED}  ✗  Porta ${port} não está registrada no proxy.${RESET}"
+        echo; pause; return
+    fi
+
+    prompt "  ${CYAN}Novo status (ex: SSH, VPN, @rg0n):${RESET} " new_status
+    if [ -z "$new_status" ]; then
+        echo "${YELLOW}  Status não pode ser vazio.${RESET}"
+        echo; pause; return
+    fi
+
+    local svc_file="/etc/systemd/system/proxyc${port}.service"
+    if [ ! -f "$svc_file" ]; then
+        echo "${RED}  ✗  Arquivo de serviço não encontrado.${RESET}"
+        echo; pause; return
+    fi
+
+    sudo sed -i "s|ExecStart=.*|ExecStart=${PROXY_BIN} --port ${port} --status ${new_status}|" "$svc_file"
+    sudo systemctl daemon-reload
+    sudo systemctl restart "proxyc${port}.service"
+
+    echo
+    echo "${GREEN}  ✔  Status da porta ${port} alterado para '${new_status}' e serviço reiniciado.${RESET}"
+    echo; pause
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -442,11 +554,13 @@ draw_menu() {
     printf "%s║%s                                                              %s║%s\n" "$CYAN" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s1%s  %sAbrir porta%s           %s2%s  %sFechar porta%s                   %s║%s\n" \
         "$CYAN" "$RESET" "$GREEN"   "$RESET" "$WHITE" "$RESET" "$GREEN"   "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s3%s  %sReiniciar porta%s       %s4%s  %sConexões por porta%s              %s║%s\n" \
-        "$CYAN" "$RESET" "$YELLOW"  "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s5%s  %sAtualizar proxy%s       %s6%s  %sGerenciador (htop)%s              %s║%s\n" \
+    printf "%s║%s   %s3%s  %sReiniciar porta%s       %s4%s  %sAlterar status%s                 %s║%s\n" \
+        "$CYAN" "$RESET" "$YELLOW"  "$RESET" "$WHITE" "$RESET" "$YELLOW"  "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s5%s  %sConexões por porta%s    %s6%s  %sPortas da máquina%s               %s║%s\n" \
+        "$CYAN" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s7%s  %sAtualizar proxy%s       %s8%s  %sGerenciador (htop)%s              %s║%s\n" \
         "$CYAN" "$RESET" "$MAGENTA" "$RESET" "$WHITE" "$RESET" "$BLUE"    "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s7%s  %sMenu SSH%s              %s0%s  %sSair%s                           %s║%s\n" \
+    printf "%s║%s   %s9%s  %sMenu SSH%s              %s0%s  %sSair%s                           %s║%s\n" \
         "$CYAN" "$RESET" "$CYAN"    "$RESET" "$WHITE" "$RESET" "$RED"     "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s                                                              %s║%s\n" "$CYAN" "$RESET" "$CYAN" "$RESET"
     printf "%s╚══════════════════════════════════════════════════════════════╝%s\n" "$CYAN" "$RESET"
@@ -525,19 +639,27 @@ show_menu() {
             pause
             ;;
 
-        4)  # Conexões por porta
+        4)  # Alterar status
+            change_port_status
+            ;;
+
+        5)  # Conexões por porta
             show_connections
             ;;
 
-        5)  # Atualizar
+        6)  # Portas da máquina
+            show_open_ports
+            ;;
+
+        7)  # Atualizar
             check_and_update
             ;;
 
-        6)  # htop
+        8)  # htop
             htop
             ;;
 
-        7)  # Menu SSH
+        9)  # Menu SSH
             menu
             ;;
 
