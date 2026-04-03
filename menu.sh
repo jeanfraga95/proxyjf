@@ -47,12 +47,17 @@ get_cpu_usage() {
     printf "%.0f" "${cpu:-0}"
 }
 
+# Retorna "pct used total" em uma linha só (evita chamar free 2x)
+_get_mem_raw() {
+    free -m | awk 'NR==2{ if($2>0) printf "%d %d %d", $3*100/$2, $3, $2; else print "0 0 0" }'
+}
+
 get_mem_pct() {
-    free -m | awk 'NR==2{ if($2>0) printf "%.0f", $3*100/$2; else print "0" }'
+    _get_mem_raw | awk '{print $1}'
 }
 
 get_mem_info() {
-    free -m | awk 'NR==2{ printf "%d%% (%d/%d MB)", $3*100/$2, $3, $2 }'
+    _get_mem_raw | awk '{printf "%d%% (%d/%d MB)", $1, $2, $3}' | tr -d '\n'
 }
 
 get_color_bar() {
@@ -337,24 +342,27 @@ show_connections() {
     local total_conn=0
 
     while read -r port; do
-        # Lista IPs remotos com conexão ESTABLISHED nessa porta
-        local conns_raw
-        conns_raw=$(ss -tn state established 2>/dev/null \
-            | awk -v p=":${port}" '($4 ~ p) || ($5 ~ p) { print $5 }' \
-            | sed 's/:[0-9]*$//' \
-            | grep -v '^$' \
-            | sort -u)
-
-        # Contagem segura: se vazio → 0
-        local count=0
-        if [ -n "$conns_raw" ]; then
-            count=$(printf '%s\n' "$conns_raw" | grep -c '.')
-        fi
-
-        total_conn=$(( total_conn + count ))
-
         local sym
         sym=$(get_port_status_symbol "$port")
+
+        # O proxy aceita na porta $port e faz fork() — após o fork o filho
+        # faz a ponte cliente<->SSH. As conexões aparecem no ss de duas formas:
+        #   1) ESTAB  local=*:$port          peer=IP_CLIENTE:porta_efemera
+        #   2) ESTAB  local=IP_LOCAL:$port   peer=IP_CLIENTE:porta_efemera
+        # Usamos ss -tnp sem filtro de state para pegar todas as ESTAB na porta.
+
+        local conns_raw
+        conns_raw=$(ss -tn 2>/dev/null             | awk -v p=":${port}" '
+                /ESTAB/ {
+                    # coluna 4 = local addr:port, coluna 5 = peer addr:port
+                    if ($4 ~ p) { print $5 }
+                }
+            '             | sed 's/:[0-9]*$//'             | grep -vE '^(\*|)$'             | sort -u)
+
+        local count=0
+        [ -n "$conns_raw" ] && count=$(printf '%s\n' "$conns_raw" | grep -c '^.')
+
+        total_conn=$(( total_conn + count ))
 
         printf "  %s  %s[%-6s]%s  %s%d usuário(s) conectado(s)%s\n" \
             "$sym" "$WHITE" "$port" "$RESET" "$CYAN" "$count" "$RESET"
@@ -362,11 +370,11 @@ show_connections() {
         if [ "$count" -gt 0 ]; then
             while IFS= read -r ip; do
                 [ -z "$ip" ] && continue
+                # Tenta resolver hostname sem travar (timeout 1s)
                 local resolved
-                resolved=$(timeout 1 host "$ip" 2>/dev/null \
-                    | awk '/domain name pointer/{gsub(/\.$/,"",$NF); print $NF; exit}')
+                resolved=$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')
                 [ -z "$resolved" ] && resolved="$ip"
-                printf "       %s→  %-18s%s  %s%s%s\n" \
+                printf "       %s→  %-20s%s  %s%s%s\n" \
                     "$DIM" "$ip" "$RESET" "$DIM" "$resolved" "$RESET"
             done <<< "$conns_raw"
         fi
