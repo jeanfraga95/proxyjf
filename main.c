@@ -14,13 +14,12 @@
 #include <sys/wait.h>
 
 #define BUFFER_SIZE      65536
-#define INBUF_SIZE       (BUFFER_SIZE * 8)   /* buffer acumulador */
-#define READ_TIMEOUT_MS  3000
-#define SPLIT_TIMEOUT_MS 5000                /* tempo extra para o [split] */
+#define READ_TIMEOUT     3
 #define CONNECT_TIMEOUT  5
 #define MAX_STATUS       64
 #define MAX_BACKEND      32
 
+/* ------------------------------------------------------------------ */
 typedef struct {
     char pattern[64];
     char host[64];
@@ -37,6 +36,7 @@ typedef struct {
 static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
 static ProxyConfig       CONFIG         = {0};
+
 static volatile sig_atomic_t reload_flag = 0;
 static int                   saved_argc  = 0;
 static char                **saved_argv  = NULL;
@@ -88,10 +88,10 @@ static void parse_args(int argc, char *argv[]) {
 
     if (new_cfg.backend_count == 0) {
         strcpy(new_cfg.backends[0].pattern, "SSH");
-        strcpy(new_cfg.backends[0].host,    "127.0.0.1");
+        strcpy(new_cfg.backends[0].host,    "0.0.0.0");
         new_cfg.backends[0].port = 22;
         strcpy(new_cfg.backends[1].pattern, "");
-        strcpy(new_cfg.backends[1].host,    "127.0.0.1");
+        strcpy(new_cfg.backends[1].host,    "0.0.0.0");
         new_cfg.backends[1].port = 22;
         new_cfg.backend_count = 2;
     }
@@ -112,10 +112,13 @@ static void handle_sighup(int sig)  { (void)sig; reload_flag = 1; }
 static void handle_sigchld(int sig) { (void)sig; while (waitpid(-1, NULL, WNOHANG) > 0); }
 
 /* ------------------------------------------------------------------ */
-/* Aguarda dados no socket com timeout em milissegundos.               */
+/* Aguarda dados no socket com timeout em ms.                           */
+/* Retorna 1 se há dados, 0 se timeout, -1 se erro.                    */
 /* ------------------------------------------------------------------ */
-static int wait_readable(int sock, int ms) {
-    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+static int wait_readable(int sock, int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(sock, &fds);
@@ -123,77 +126,64 @@ static int wait_readable(int sock, int ms) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Encontra o fim do primeiro request HTTP no buffer.                  */
-/*                                                                     */
-/* Suporta todos os terminadores usados por apps de injeção HTTP:      */
-/*   \r\n\r\n  — RFC padrão                                            */
-/*   \n\n      — LF simples (ACL, CHECKIN, etc.)                       */
-/*   \r\n\n    — misto (algumas ferramentas)                           */
-/*                                                                     */
-/* Retorna o offset do byte APÓS o terminador, ou -1 se incompleto.   */
+/* Lê UM request HTTP completo (até \r\n\r\n OU \n\n).                 */
+/* Suporta tanto CRLF (\r\n) quanto LF simples (\n) como separador.    */
+/* Retorna bytes lidos ou 0 em timeout / erro.                          */
 /* ------------------------------------------------------------------ */
-static int find_request_end(const char *buf, int len) {
-    for (int i = 0; i < len; i++) {
-        if (buf[i] != '\n') continue;
+static int read_http_request(int sock, char *buf, int bufsz) {
+    int total = 0;
+    memset(buf, 0, bufsz);
 
-        /* \n\n */
-        if (i + 1 < len && buf[i+1] == '\n')
-            return i + 2;
+    while (total < bufsz - 1) {
+        if (wait_readable(sock, READ_TIMEOUT * 1000) <= 0) {
+            fprintf(stderr, "[read_http] timeout após %d bytes\n", total);
+            break;
+        }
 
-        /* \r\n\r\n — o \n está em i, então o \r está em i-1 */
-        if (i >= 1 && buf[i-1] == '\r' &&
-            i + 2 < len && buf[i+1] == '\r' && buf[i+2] == '\n')
-            return i + 3;
+        ssize_t n = recv(sock, buf + total, 1, 0);
+        if (n <= 0) break;
+        total++;
+        buf[total] = '\0';
+
+        /*
+         * Detecta fim de headers em dois formatos:
+         *   CRLF: \r\n\r\n  (RFC 7230)
+         *   LF:   \n\n      (payloads não-padrão como ACL, CHECKIN, etc.)
+         */
+        if (total >= 4 &&
+            buf[total-4] == '\r' && buf[total-3] == '\n' &&
+            buf[total-2] == '\r' && buf[total-1] == '\n')
+            break;
+
+        if (total >= 2 &&
+            buf[total-2] == '\n' && buf[total-1] == '\n')
+            break;
     }
-    return -1;
+
+    return total;
 }
 
 /* ------------------------------------------------------------------ */
-/* Classificação de um request                                          */
+/* Peek sem consumir — usado para detectar o backend no payload final.  */
 /* ------------------------------------------------------------------ */
-typedef enum {
-    REQ_UNKNOWN,
-    REQ_INTERMEDIATE,    /* GET, ACL, CHECKIN, etc  → 200 OK          */
-    REQ_TUNNEL_UPGRADE,  /* tem Upgrade: websocket  → 101             */
-    REQ_TUNNEL_OPEN,     /* tem Content-Length huge → 200 + túnel     */
-    REQ_PROXYC,          /* tem proxyc:on           → duplo 200+túnel */
-} ReqType;
-
-static ReqType classify_request(const char *req, int len) {
-    if (len <= 0) return REQ_UNKNOWN;
-
-    /* proxyc:on */
-    if (memmem(req, len, "proxyc:on",  9) ||
-        memmem(req, len, "proxyc: on", 10))
-        return REQ_PROXYC;
-
-    /* Content-Length com valor gigante (≥ 1 bilhão) */
-    const char *cl = memmem(req, len, "Content-Length:", 15);
-    if (!cl)    cl = memmem(req, len, "content-length:", 15);
-    if (cl) {
-        long long v = atoll(cl + 15);
-        if (v > 1000000000LL) return REQ_TUNNEL_OPEN;
-    }
-
-    /* Upgrade: websocket */
-    if (memmem(req, len, "Upgrade:",  8) ||
-        memmem(req, len, "upgrade:",  8))
-        return REQ_TUNNEL_UPGRADE;
-
-    return REQ_INTERMEDIATE;
+static int peek_data(int sock, char *buf, int len) {
+    if (wait_readable(sock, READ_TIMEOUT * 1000) <= 0) return 0;
+    int n = recv(sock, buf, len - 1, MSG_PEEK);
+    if (n > 0) buf[n] = '\0';
+    return n > 0 ? n : 0;
 }
 
 /* ------------------------------------------------------------------ */
 static void *transfer(void *arg) {
     int    *fds = (int *)arg;
     char    buf[BUFFER_SIZE];
-    ssize_t n;
-    while ((n = read(fds[0], buf, BUFFER_SIZE)) > 0) {
-        ssize_t s = 0;
-        while (s < n) {
-            ssize_t w = write(fds[1], buf + s, n - s);
+    ssize_t bytes;
+    while ((bytes = read(fds[0], buf, BUFFER_SIZE)) > 0) {
+        ssize_t sent = 0;
+        while (sent < bytes) {
+            ssize_t w = write(fds[1], buf + sent, bytes - sent);
             if (w <= 0) goto done;
-            s += w;
+            sent += w;
         }
     }
 done:
@@ -203,6 +193,7 @@ done:
     return NULL;
 }
 
+/* ------------------------------------------------------------------ */
 static BackendRule *detect_backend(const char *data, int len) {
     pthread_rwlock_rdlock(&config_lock);
     int fallback = (CONFIG.backend_count > 1) ? 1 : 0;
@@ -211,7 +202,8 @@ static BackendRule *detect_backend(const char *data, int len) {
             if (CONFIG.backends[i].pattern[0] &&
                 memmem(data, len,
                        CONFIG.backends[i].pattern,
-                       strlen(CONFIG.backends[i].pattern))) {
+                       strlen(CONFIG.backends[i].pattern)))
+            {
                 BackendRule *r = &CONFIG.backends[i];
                 pthread_rwlock_unlock(&config_lock);
                 return r;
@@ -223,258 +215,243 @@ static BackendRule *detect_backend(const char *data, int len) {
     return r;
 }
 
+/* ------------------------------------------------------------------ */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr = {0};
-    socklen_t slen; int fam;
+    socklen_t saddr_len; int family;
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
-        fam = AF_INET6; s6->sin6_family = AF_INET6;
-        s6->sin6_port = htons(port); slen = sizeof(*s6);
+        family = AF_INET6; s6->sin6_family = AF_INET6;
+        s6->sin6_port = htons(port); saddr_len = sizeof(*s6);
     } else if (inet_pton(AF_INET, host, &s4->sin_addr) == 1) {
-        fam = AF_INET; s4->sin_family = AF_INET;
-        s4->sin_port = htons(port); slen = sizeof(*s4);
+        family = AF_INET; s4->sin_family = AF_INET;
+        s4->sin_port = htons(port); saddr_len = sizeof(*s4);
     } else {
-        fprintf(stderr, "[backend] host inválido: %s\n", host);
-        return -1;
+        fprintf(stderr, "[backend] host inválido: %s\n", host); return -1;
     }
 
-    int sock = socket(fam, SOCK_STREAM, 0);
+    int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
 
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-    int r = connect(sock, (struct sockaddr *)&saddr, slen);
+
+    int r = connect(sock, (struct sockaddr *)&saddr, saddr_len);
     if (r < 0 && errno != EINPROGRESS) {
         perror("connect"); close(sock); return -1;
     }
     if (r != 0) {
-        fd_set w; struct timeval tv = {CONNECT_TIMEOUT, 0};
-        FD_ZERO(&w); FD_SET(sock, &w);
-        if (select(sock + 1, NULL, &w, NULL, &tv) <= 0) {
+        fd_set wfds; struct timeval tv = {CONNECT_TIMEOUT, 0};
+        FD_ZERO(&wfds); FD_SET(sock, &wfds);
+        if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
             fprintf(stderr, "[backend] timeout %s:%d\n", host, port);
             close(sock); return -1;
         }
-        int e = 0; socklen_t el = sizeof(e);
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &e, &el);
-        if (e) { fprintf(stderr, "[backend] errno=%d %s:%d\n", e, host, port);
-                 close(sock); return -1; }
+        int so_err = 0; socklen_t sl = sizeof(so_err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &sl);
+        if (so_err) {
+            fprintf(stderr, "[backend] erro=%d %s:%d\n", so_err, host, port);
+            close(sock); return -1;
+        }
     }
     fcntl(sock, F_SETFL, flags);
     return sock;
 }
 
 /* ------------------------------------------------------------------ */
-/* handle_client — parser de chunks com janela deslizante              */
-/*                                                                     */
-/* ALGORITMO:                                                           */
-/* 1. Lê dados em chunks para inbuf[] acumulando tudo                  */
-/* 2. Para cada request completo encontrado no buffer:                 */
-/*    - classifica                                                      */
-/*    - envia resposta HTTP correspondente                              */
-/*    - se for TUNNEL_OPEN ou PROXYC → abre túnel e sai               */
-/* 3. Se buffer esvaziou sem TUNNEL_OPEN, aguarda mais dados           */
-/*    (cobre o [split] real do payload)                                */
-/*                                                                     */
-/* Por que isso funciona e o byte-a-byte não:                          */
-/* [instant_split] envia vários requests em um único segmento TCP.     */
-/* recv() devolve tudo de uma vez. O parser de fronteira separa cada   */
-/* request dentro do buffer sem precisar de chamadas select() extras.  */
+/* Classificação de um request individual                               */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    REQ_UNKNOWN,
+    REQ_TUNNEL_UPGRADE,   /* tem "Upgrade:" → responde 101             */
+    REQ_TUNNEL_OPEN,      /* tem Content-Length muito grande → 200+túnel*/
+    REQ_INTERMEDIATE,     /* GET, ACL, CHECKIN, etc → responde 200     */
+    REQ_PROXYC,           /* tem "proxyc:on" → duplo 200               */
+} ReqType;
+
+static ReqType classify_request(const char *req) {
+    if (!req || req[0] == '\0') return REQ_UNKNOWN;
+
+    if (strstr(req, "proxyc:on") || strstr(req, "proxyc: on"))
+        return REQ_PROXYC;
+
+    /* Content-Length: 9999999999999 → gatilho do túnel */
+    const char *cl = strstr(req, "Content-Length:");
+    if (!cl) cl = strstr(req, "content-length:");
+    if (cl) {
+        long long val = atoll(cl + 15);
+        if (val > 1000000000LL)
+            return REQ_TUNNEL_OPEN;
+    }
+
+    if (strstr(req, "Upgrade:") || strstr(req, "upgrade:"))
+        return REQ_TUNNEL_UPGRADE;
+
+    return REQ_INTERMEDIATE;
+}
+
+/* ------------------------------------------------------------------ */
+/*
+ * handle_client — loop genérico multi-status
+ *
+ * Lógica:
+ *   - Lê requests um a um
+ *   - Para cada request INTERMEDIATE: responde com o próximo status da lista
+ *   - Para TUNNEL_UPGRADE: responde 101 + próximo status
+ *   - Para TUNNEL_OPEN: responde 200 + abre túnel → sai do loop
+ *   - Para PROXYC: duplo 200 → abre túnel → sai do loop
+ *
+ * O --status-list define os textos dos status nas respostas intermediárias.
+ * Se a lista tiver 1 item, todos usam o mesmo texto.
+ * Se tiver N itens, cada resposta usa o próximo da lista (circular).
+ */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
-    static char inbuf[INBUF_SIZE];   /* buffer acumulador  */
-    char        resp[256];
-    int         inlen     = 0;       /* bytes em inbuf[]   */
-    int         proc      = 0;       /* offset já parseado */
-    int         req_count = 0;
-    int         status_idx = 0;
-    int         done      = 0;
+    char        req[BUFFER_SIZE];
+    char        resp[512];
+    int         status_idx = 0;   /* índice circular na lista de status */
+    int         req_count  = 0;
+    const char *status;
 
+    /* Lê configuração uma vez */
     pthread_rwlock_rdlock(&config_lock);
-    int scount = CONFIG.status_count;
+    int status_count = CONFIG.status_count;
     pthread_rwlock_unlock(&config_lock);
 
-    memset(inbuf, 0, sizeof(inbuf));
-
-    while (!done) {
-        /* ---- Tenta encontrar um request completo no buffer ---- */
-        while (proc < inlen) {
-            int avail = inlen - proc;
-            int end   = find_request_end(inbuf + proc, avail);
-
-            if (end < 0) break;  /* request incompleto — precisa de mais dados */
-
-            /* Temos um request completo: inbuf[proc .. proc+end-1] */
-            const char *req    = inbuf + proc;
-            int         reqlen = end;
-            proc += end;
-            req_count++;
-
-            /* Status atual (circular) */
-            pthread_rwlock_rdlock(&config_lock);
-            const char *status = CONFIG.statuses[status_idx % CONFIG.status_count];
-            pthread_rwlock_unlock(&config_lock);
-            status_idx++;
-
-            ReqType type = classify_request(req, reqlen);
-
-            /* Log: extrai método */
-            char method[16] = "?";
-            for (int k = 0; k < reqlen && k < 15; k++) {
-                if (req[k] == ' ' || req[k] == '\r' || req[k] == '\n') {
-                    method[k] = '\0'; break;
-                }
-                if (req[k] >= 'A' && req[k] <= 'Z') method[k] = req[k];
-                else method[k] = req[k];
-            }
-            fprintf(stderr, "[req #%d] %-8s type=%d status=\"%s\"\n",
-                    req_count, method, type, status);
-
-            switch (type) {
-
-            case REQ_INTERMEDIATE:
-            case REQ_UNKNOWN:
-                /* GET, ACL, CHECKIN, UNLOCK sem flags especiais → 200 OK */
-                snprintf(resp, sizeof(resp),
-                         "HTTP/1.1 200 OK %s\r\n\r\n", status);
-                if (write(client_sock, resp, strlen(resp)) <= 0)
-                    { close(client_sock); return; }
-                fprintf(stderr, "[resp] 200 OK (intermediário)\n");
-                break;
-
-            case REQ_TUNNEL_UPGRADE:
-                /* Upgrade: websocket → 101 Switching Protocols */
-                snprintf(resp, sizeof(resp),
-                         "HTTP/1.1 101 %s\r\n\r\n", status);
-                if (write(client_sock, resp, strlen(resp)) <= 0)
-                    { close(client_sock); return; }
-                fprintf(stderr, "[resp] 101 Upgrade\n");
-                break;
-
-            case REQ_TUNNEL_OPEN:
-                /* Content-Length gigante → 200 OK → abre túnel */
-                snprintf(resp, sizeof(resp),
-                         "HTTP/1.1 200 OK %s\r\n\r\n", status);
-                if (write(client_sock, resp, strlen(resp)) <= 0)
-                    { close(client_sock); return; }
-                fprintf(stderr, "[resp] 200 OK → TÚNEL (%d requests processados)\n",
-                        req_count);
-                done = 1;
-                break;
-
-            case REQ_PROXYC:
-                /* proxyc:on → duplo 200 → abre túnel */
-                snprintf(resp, sizeof(resp),
-                         "HTTP/1.1 200 OK %s\r\n\r\n", status);
-                write(client_sock, resp, strlen(resp));
-                write(client_sock, resp, strlen(resp));
-                fprintf(stderr, "[resp] duplo 200 (proxyc) → TÚNEL\n");
-                done = 1;
-                break;
-            }
-
-            /* Segurança: evita loop infinito sem sinal de túnel */
-            if (!done && req_count > scount * 3 + 12) {
-                fprintf(stderr, "[loop] limite atingido (%d), encerrando\n",
-                        req_count);
-                close(client_sock);
-                return;
-            }
-        }
-
-        if (done) break;
-
-        /* ---- Precisa de mais dados ---- */
-
-        /*
-         * Compacta o buffer: descarta os bytes já processados.
-         * Isso mantém inbuf[] com apenas dados não processados.
-         */
-        if (proc > 0) {
-            memmove(inbuf, inbuf + proc, inlen - proc);
-            inlen -= proc;
-            proc   = 0;
-        }
-
-        if (inlen >= (int)sizeof(inbuf) - 1) {
-            fprintf(stderr, "[loop] buffer cheio sem túnel\n");
+    while (1) {
+        int n = read_http_request(client_sock, req, sizeof(req));
+        if (n <= 0) {
+            fprintf(stderr, "[loop] sem dados após %d requests\n", req_count);
             close(client_sock);
             return;
         }
+        req_count++;
 
-        /*
-         * Aguarda mais dados.
-         * Usa SPLIT_TIMEOUT para cobrir o atraso do [split] real
-         * (que é um segmento TCP separado enviado depois).
-         */
-        int timeout_ms = (req_count == 0) ? READ_TIMEOUT_MS : SPLIT_TIMEOUT_MS;
-        if (wait_readable(client_sock, timeout_ms) <= 0) {
-            if (req_count == 0) {
-                fprintf(stderr, "[loop] timeout sem nenhum request\n");
-                close(client_sock);
-                return;
-            }
-            /*
-             * Timeout após alguns requests: pode ser que o payload
-             * não termine com Content-Length gigante.
-             * Tenta abrir o túnel com o que temos.
-             */
-            fprintf(stderr, "[loop] timeout após %d requests — abrindo túnel\n",
+        /* Pega o status atual da lista de forma circular */
+        pthread_rwlock_rdlock(&config_lock);
+        status = CONFIG.statuses[status_idx % CONFIG.status_count];
+        pthread_rwlock_unlock(&config_lock);
+        status_idx++;
+
+        ReqType type = classify_request(req);
+
+        /* Extrai o método HTTP para o log */
+        char method[16] = "?";
+        sscanf(req, "%15s", method);
+        fprintf(stderr, "[req #%d] method=%-8s type=%d status=\"%s\"\n",
+                req_count, method, type, status);
+
+        switch (type) {
+
+        /* ---- Request intermediário (GET, ACL, CHECKIN, etc.) ---- */
+        case REQ_INTERMEDIATE:
+            snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 200 OK %s\r\n"
+                     "Content-Length: 0\r\n"
+                     "Connection: keep-alive\r\n\r\n",
+                     status);
+            if (write(client_sock, resp, strlen(resp)) <= 0)
+                { close(client_sock); return; }
+            fprintf(stderr, "[resp] 200 OK (intermediário)\n");
+            break;
+
+        /* ---- UNLOCK/GET com Upgrade: websocket → 101 ---- */
+        case REQ_TUNNEL_UPGRADE:
+            snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 101 %s\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Upgrade: websocket\r\n\r\n",
+                     status);
+            if (write(client_sock, resp, strlen(resp)) <= 0)
+                { close(client_sock); return; }
+            fprintf(stderr, "[resp] 101 Upgrade\n");
+            break;
+
+        /* ---- UNLOCK com Content-Length gigante → 200 + abre túnel ---- */
+        case REQ_TUNNEL_OPEN:
+            snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 200 OK %s\r\n"
+                     "Content-Length: 0\r\n\r\n",
+                     status);
+            if (write(client_sock, resp, strlen(resp)) <= 0)
+                { close(client_sock); return; }
+            fprintf(stderr, "[resp] 200 OK → TÚNEL ABERTO (%d respostas enviadas)\n",
                     req_count);
-            done = 1;
+            goto open_tunnel;
+
+        /* ---- proxyc:on → duplo 200 + abre túnel ---- */
+        case REQ_PROXYC:
+            snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 200 OK %s\r\n\r\n", status);
+            write(client_sock, resp, strlen(resp));
+            write(client_sock, resp, strlen(resp));
+            fprintf(stderr, "[resp] duplo 200 (proxyc) → TÚNEL ABERTO\n");
+            goto open_tunnel;
+
+        default:
+            /* Request não reconhecido: responde 200 e continua */
+            snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 200 OK %s\r\n"
+                     "Content-Length: 0\r\n\r\n",
+                     status);
+            if (write(client_sock, resp, strlen(resp)) <= 0)
+                { close(client_sock); return; }
             break;
         }
 
-        int n = recv(client_sock, inbuf + inlen,
-                     sizeof(inbuf) - inlen - 1, 0);
-        if (n <= 0) {
-            fprintf(stderr, "[loop] recv=%d errno=%d\n", n, errno);
+        /*
+         * Segurança: se enviamos mais respostas do que o dobro da
+         * lista de status e nenhum gatilho de túnel apareceu,
+         * algo está errado — evita loop infinito.
+         */
+        if (req_count > status_count * 2 + 8) {
+            fprintf(stderr, "[loop] excedeu limite de requests (%d), encerrando\n",
+                    req_count);
             close(client_sock);
             return;
         }
-        inlen += n;
-        inbuf[inlen] = '\0';
-        fprintf(stderr, "[recv] +%d bytes (total=%d)\n", n, inlen);
     }
 
+open_tunnel:
     /* ----------------------------------------------------------------
-     * TÚNEL ABERTO
-     * Detecta backend via peek (dados SSH/VPN reais).
-     * SSH não envia primeiro (espera banner) → timeout normal,
-     * fallback = porta 22.
+     * Detecta o backend:
+     * Peek do próximo payload (dados SSH/VPN reais).
+     * SSH não envia nada imediatamente (espera banner) → timeout
+     * é normal e o fallback (porta 22) cobre esse caso.
      * ---------------------------------------------------------------- */
-    char peek[4096] = {0};
-    int  peek_n = 0;
-    if (wait_readable(client_sock, 1500) > 0) {
-        peek_n = recv(client_sock, peek, sizeof(peek) - 1, MSG_PEEK);
-        if (peek_n < 0) peek_n = 0;
+    {
+        char peek[BUFFER_SIZE] = {0};
+        int  peek_n = peek_data(client_sock, peek, sizeof(peek));
+        BackendRule *backend = detect_backend(peek, peek_n);
+        fprintf(stderr, "[backend] %s:%d (peek=%d bytes)\n",
+                backend->host, backend->port, peek_n);
+
+        int server_sock = connect_backend(backend->host, backend->port);
+        if (server_sock < 0) { close(client_sock); return; }
+
+        pthread_t t1, t2;
+        int *c2s = malloc(2 * sizeof(int));
+        int *s2c = malloc(2 * sizeof(int));
+        c2s[0] = client_sock; c2s[1] = server_sock;
+        s2c[0] = server_sock; s2c[1] = client_sock;
+
+        pthread_create(&t1, NULL, transfer, c2s);
+        pthread_create(&t2, NULL, transfer, s2c);
+        pthread_join(t1, NULL);
+        pthread_join(t2, NULL);
+
+        close(client_sock);
+        close(server_sock);
     }
-    BackendRule *backend = detect_backend(peek, peek_n);
-    fprintf(stderr, "[backend] %s:%d (peek=%d bytes)\n",
-            backend->host, backend->port, peek_n);
-
-    int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) { close(client_sock); return; }
-
-    pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int));
-    int *s2c = malloc(2 * sizeof(int));
-    c2s[0] = client_sock; c2s[1] = server_sock;
-    s2c[0] = server_sock; s2c[1] = client_sock;
-    pthread_create(&t1, NULL, transfer, c2s);
-    pthread_create(&t2, NULL, transfer, s2c);
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
-
-    close(client_sock);
-    close(server_sock);
 }
 
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
-    struct sockaddr_storage ca;
-    socklen_t cl = sizeof(ca);
+    struct sockaddr_storage client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
     while (1) {
         if (reload_flag) {
             reload_flag = 0;
@@ -482,20 +459,33 @@ static void accept_loop(int server_sock) {
             printf("[SIGHUP] status=%d backends=%d\n",
                    CONFIG.status_count, CONFIG.backend_count);
         }
-        int cs = accept(server_sock, (struct sockaddr *)&ca, &cl);
-        if (cs < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
+
+        int client_sock = accept(server_sock,
+                                 (struct sockaddr *)&client_addr, &client_len);
+        if (client_sock < 0) {
+            if (errno == EINTR) continue;
+            perror("accept"); continue;
+        }
 
         char ip[INET6_ADDRSTRLEN] = {0};
-        if (ca.ss_family == AF_INET6)
-            inet_ntop(AF_INET6, &((struct sockaddr_in6*)&ca)->sin6_addr, ip, sizeof(ip));
+        if (client_addr.ss_family == AF_INET6)
+            inet_ntop(AF_INET6,
+                      &((struct sockaddr_in6*)&client_addr)->sin6_addr,
+                      ip, sizeof(ip));
         else
-            inet_ntop(AF_INET,  &((struct sockaddr_in *)&ca)->sin_addr,  ip, sizeof(ip));
+            inet_ntop(AF_INET,
+                      &((struct sockaddr_in *)&client_addr)->sin_addr,
+                      ip, sizeof(ip));
         fprintf(stderr, "[+] %s\n", ip);
 
         pid_t pid = fork();
-        if (pid < 0) { perror("fork"); close(cs); continue; }
-        if (pid == 0) { close(server_sock); handle_client(cs); exit(0); }
-        close(cs);
+        if (pid < 0) { perror("fork"); close(client_sock); continue; }
+        if (pid == 0) {
+            close(server_sock);
+            handle_client(client_sock);
+            exit(0);
+        }
+        close(client_sock);
     }
 }
 
@@ -503,36 +493,45 @@ static void accept_loop(int server_sock) {
 int main(int argc, char *argv[]) {
     srand(time(NULL));
     signal(SIGPIPE, SIG_IGN);
-    saved_argc = argc; saved_argv = argv;
+
+    saved_argc = argc;
+    saved_argv = argv;
     parse_args(argc, argv);
 
-    struct sigaction sa = {0};
-    sa.sa_handler = handle_sighup;
-    sigaction(SIGHUP, &sa, NULL);
-    sa.sa_handler = handle_sigchld;
-    sa.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa, NULL);
+    struct sigaction sa_hup  = {0};
+    sa_hup.sa_handler = handle_sighup;
+    sigaction(SIGHUP, &sa_hup, NULL);
 
-    int ss = socket(AF_INET6, SOCK_STREAM, 0);
-    if (ss < 0) { perror("socket"); return 1; }
-    int opt = 1, v6 = 0;
-    setsockopt(ss, SOL_SOCKET,   SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(ss, IPPROTO_IPV6, IPV6_V6ONLY,  &v6,  sizeof(v6));
+    struct sigaction sa_chld = {0};
+    sa_chld.sa_handler = handle_sigchld;
+    sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
+    int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
+    if (server_sock < 0) { perror("socket"); return 1; }
+
+    int opt = 1, v6only = 0;
+    setsockopt(server_sock, SOL_SOCKET,   SO_REUSEADDR, &opt,    sizeof(opt));
+    setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY,  &v6only, sizeof(v6only));
 
     struct sockaddr_in6 addr = {0};
     addr.sin6_family = AF_INET6;
     addr.sin6_port   = htons(PORT);
     addr.sin6_addr   = in6addr_any;
-    if (bind(ss,   (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind");   return 1; }
-    if (listen(ss, 256) < 0)                                     { perror("listen"); return 1; }
 
-    printf("ProxyC porta %d | status=%d | backends=%d\n",
+    if (bind(server_sock,   (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        { perror("bind");   return 1; }
+    if (listen(server_sock, 256) < 0)
+        { perror("listen"); return 1; }
+
+    printf("ProxyC porta %d (IPv4+IPv6) | status=%d | backends=%d\n",
            PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Reload: kill -HUP %d\n", getpid());
 
-    accept_loop(ss);
+    accept_loop(server_sock);
+
     pthread_rwlock_destroy(&config_lock);
     free_config(&CONFIG);
-    close(ss);
+    close(server_sock);
     return 0;
 }
