@@ -14,12 +14,11 @@
 #include <sys/wait.h>
 
 #define BUFFER_SIZE      65536
-#define READ_TIMEOUT     3
+#define PEEK_TIMEOUT     3
 #define CONNECT_TIMEOUT  5
-#define MAX_STATUS       64
+#define MAX_STATUS       32
 #define MAX_BACKEND      32
 
-/* ------------------------------------------------------------------ */
 typedef struct {
     char pattern[64];
     char host[64];
@@ -112,30 +111,23 @@ static void handle_sighup(int sig)  { (void)sig; reload_flag = 1; }
 static void handle_sigchld(int sig) { (void)sig; while (waitpid(-1, NULL, WNOHANG) > 0); }
 
 /* ------------------------------------------------------------------ */
-/* Aguarda dados no socket com timeout em ms.                           */
-/* Retorna 1 se há dados, 0 se timeout, -1 se erro.                    */
-/* ------------------------------------------------------------------ */
-static int wait_readable(int sock, int timeout_ms) {
-    struct timeval tv;
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(sock, &fds);
-    return select(sock + 1, &fds, NULL, NULL, &tv);
-}
-
-/* ------------------------------------------------------------------ */
-/* Lê UM request HTTP completo (até \r\n\r\n OU \n\n).                 */
-/* Suporta tanto CRLF (\r\n) quanto LF simples (\n) como separador.    */
-/* Retorna bytes lidos ou 0 em timeout / erro.                          */
+/* Lê UM request HTTP completo (até \r\n\r\n) para o buffer.           */
+/* Retorna bytes lidos ou -1 em erro/timeout.                          */
+/* CRÍTICO: não usa MSG_PEEK — consome os bytes do socket.             */
 /* ------------------------------------------------------------------ */
 static int read_http_request(int sock, char *buf, int bufsz) {
-    int total = 0;
+    int            total = 0;
+    struct timeval tv;
+    fd_set         fds;
+
     memset(buf, 0, bufsz);
 
     while (total < bufsz - 1) {
-        if (wait_readable(sock, READ_TIMEOUT * 1000) <= 0) {
+        tv.tv_sec  = PEEK_TIMEOUT;
+        tv.tv_usec = 0;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        if (select(sock + 1, &fds, NULL, NULL, &tv) <= 0) {
             fprintf(stderr, "[read_http] timeout após %d bytes\n", total);
             break;
         }
@@ -143,31 +135,29 @@ static int read_http_request(int sock, char *buf, int bufsz) {
         ssize_t n = recv(sock, buf + total, 1, 0);
         if (n <= 0) break;
         total++;
-        buf[total] = '\0';
 
-        /*
-         * Detecta fim de headers em dois formatos:
-         *   CRLF: \r\n\r\n  (RFC 7230)
-         *   LF:   \n\n      (payloads não-padrão como ACL, CHECKIN, etc.)
-         */
+        /* Detecta fim dos headers: \r\n\r\n */
         if (total >= 4 &&
             buf[total-4] == '\r' && buf[total-3] == '\n' &&
             buf[total-2] == '\r' && buf[total-1] == '\n')
+        {
             break;
-
-        if (total >= 2 &&
-            buf[total-2] == '\n' && buf[total-1] == '\n')
-            break;
+        }
     }
 
+    buf[total] = '\0';
     return total;
 }
 
 /* ------------------------------------------------------------------ */
-/* Peek sem consumir — usado para detectar o backend no payload final.  */
+/* Peek sem consumir — apenas para detectar backend após o handshake.  */
 /* ------------------------------------------------------------------ */
 static int peek_data(int sock, char *buf, int len) {
-    if (wait_readable(sock, READ_TIMEOUT * 1000) <= 0) return 0;
+    struct timeval tv = {PEEK_TIMEOUT, 0};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    if (select(sock + 1, &fds, NULL, NULL, &tv) <= 0) return 0;
     int n = recv(sock, buf, len - 1, MSG_PEEK);
     if (n > 0) buf[n] = '\0';
     return n > 0 ? n : 0;
@@ -193,7 +183,13 @@ done:
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
+static const char *get_random_status(void) {
+    pthread_rwlock_rdlock(&config_lock);
+    const char *s = CONFIG.statuses[rand() % CONFIG.status_count];
+    pthread_rwlock_unlock(&config_lock);
+    return s;
+}
+
 static BackendRule *detect_backend(const char *data, int len) {
     pthread_rwlock_rdlock(&config_lock);
     int fallback = (CONFIG.backend_count > 1) ? 1 : 0;
@@ -218,7 +214,8 @@ static BackendRule *detect_backend(const char *data, int len) {
 /* ------------------------------------------------------------------ */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr = {0};
-    socklen_t saddr_len; int family;
+    socklen_t saddr_len;
+    int family;
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
@@ -252,7 +249,7 @@ static int connect_backend(const char *host, int port) {
         int so_err = 0; socklen_t sl = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &sl);
         if (so_err) {
-            fprintf(stderr, "[backend] erro=%d %s:%d\n", so_err, host, port);
+            fprintf(stderr, "[backend] errno=%d %s:%d\n", so_err, host, port);
             close(sock); return -1;
         }
     }
@@ -261,190 +258,139 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Classificação de um request individual                               */
-/* ------------------------------------------------------------------ */
-typedef enum {
-    REQ_UNKNOWN,
-    REQ_TUNNEL_UPGRADE,   /* tem "Upgrade:" → responde 101             */
-    REQ_TUNNEL_OPEN,      /* tem Content-Length muito grande → 200+túnel*/
-    REQ_INTERMEDIATE,     /* GET, ACL, CHECKIN, etc → responde 200     */
-    REQ_PROXYC,           /* tem "proxyc:on" → duplo 200               */
-} ReqType;
-
-static ReqType classify_request(const char *req) {
-    if (!req || req[0] == '\0') return REQ_UNKNOWN;
-
-    if (strstr(req, "proxyc:on") || strstr(req, "proxyc: on"))
-        return REQ_PROXYC;
-
-    /* Content-Length: 9999999999999 → gatilho do túnel */
-    const char *cl = strstr(req, "Content-Length:");
-    if (!cl) cl = strstr(req, "content-length:");
-    if (cl) {
-        long long val = atoll(cl + 15);
-        if (val > 1000000000LL)
-            return REQ_TUNNEL_OPEN;
-    }
-
-    if (strstr(req, "Upgrade:") || strstr(req, "upgrade:"))
-        return REQ_TUNNEL_UPGRADE;
-
-    return REQ_INTERMEDIATE;
-}
-
-/* ------------------------------------------------------------------ */
-/*
- * handle_client — loop genérico multi-status
- *
- * Lógica:
- *   - Lê requests um a um
- *   - Para cada request INTERMEDIATE: responde com o próximo status da lista
- *   - Para TUNNEL_UPGRADE: responde 101 + próximo status
- *   - Para TUNNEL_OPEN: responde 200 + abre túnel → sai do loop
- *   - Para PROXYC: duplo 200 → abre túnel → sai do loop
- *
- * O --status-list define os textos dos status nas respostas intermediárias.
- * Se a lista tiver 1 item, todos usam o mesmo texto.
- * Se tiver N itens, cada resposta usa o próximo da lista (circular).
- */
+/* handle_client                                                        */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        req[BUFFER_SIZE];
     char        resp[512];
-    int         status_idx = 0;   /* índice circular na lista de status */
-    int         req_count  = 0;
     const char *status;
+    int         n;
 
-    /* Lê configuração uma vez */
-    pthread_rwlock_rdlock(&config_lock);
-    int status_count = CONFIG.status_count;
-    pthread_rwlock_unlock(&config_lock);
+    /*
+     * Lê o PRIMEIRO request completo.
+     * Isso resolve o bug central: antes usávamos MSG_PEEK que via
+     * os 3 requests juntos no mesmo buffer TCP; agora lemos apenas
+     * o primeiro e decidimos o modo com base nele.
+     */
+    n = read_http_request(client_sock, req, sizeof(req));
+    if (n <= 0) { close(client_sock); return; }
 
-    while (1) {
-        int n = read_http_request(client_sock, req, sizeof(req));
-        if (n <= 0) {
-            fprintf(stderr, "[loop] sem dados após %d requests\n", req_count);
-            close(client_sock);
-            return;
-        }
-        req_count++;
+    fprintf(stderr, "[req1] %.60s\n", req);
 
-        /* Pega o status atual da lista de forma circular */
-        pthread_rwlock_rdlock(&config_lock);
-        status = CONFIG.statuses[status_idx % CONFIG.status_count];
-        pthread_rwlock_unlock(&config_lock);
-        status_idx++;
+    /* ---- Detecção de modo ---- */
+    int is_get    = (strncmp(req, "GET ",    4) == 0);
+    int is_unlock = (strncmp(req, "UNLOCK ", 7) == 0);
+    int is_proxyc = (strstr(req, "proxyc:on") || strstr(req, "proxyc: on"));
 
-        ReqType type = classify_request(req);
+    /* ============================================================
+     * MODO MULTI-SPLIT
+     * Primeiro request é GET → espera 2 UNLOCKs na sequência.
+     * Fluxo:
+     *   GET               → 200 OK
+     *   UNLOCK + Upgrade  → 101 <status>
+     *   UNLOCK + C-Length → 200 OK
+     *   [ túnel ]
+     * ============================================================ */
+    if (is_get && !is_proxyc) {
+        fprintf(stderr, "[modo] MULTI-SPLIT\n");
 
-        /* Extrai o método HTTP para o log */
-        char method[16] = "?";
-        sscanf(req, "%15s", method);
-        fprintf(stderr, "[req #%d] method=%-8s type=%d status=\"%s\"\n",
-                req_count, method, type, status);
+        /* Passo 1: responde ao GET com 200 OK */
+        status = get_random_status();
+        snprintf(resp, sizeof(resp),
+                 "HTTP/1.1 200 OK %s\r\n"
+                 "Content-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n",
+                 status);
+        if (write(client_sock, resp, strlen(resp)) <= 0)
+            { close(client_sock); return; }
+        fprintf(stderr, "[resp] 200 OK (GET)\n");
 
-        switch (type) {
+        /* Passo 2: lê o UNLOCK + Upgrade: websocket */
+        n = read_http_request(client_sock, req, sizeof(req));
+        if (n <= 0) { close(client_sock); return; }
+        fprintf(stderr, "[req2] %.60s\n", req);
 
-        /* ---- Request intermediário (GET, ACL, CHECKIN, etc.) ---- */
-        case REQ_INTERMEDIATE:
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n"
-                     "Content-Length: 0\r\n"
-                     "Connection: keep-alive\r\n\r\n",
-                     status);
-            if (write(client_sock, resp, strlen(resp)) <= 0)
-                { close(client_sock); return; }
-            fprintf(stderr, "[resp] 200 OK (intermediário)\n");
-            break;
+        /* Responde com 101 Switching Protocols */
+        status = get_random_status();
+        snprintf(resp, sizeof(resp),
+                 "HTTP/1.1 101 %s\r\n"
+                 "Connection: Upgrade\r\n"
+                 "Upgrade: websocket\r\n\r\n",
+                 status);
+        if (write(client_sock, resp, strlen(resp)) <= 0)
+            { close(client_sock); return; }
+        fprintf(stderr, "[resp] 101 (UNLOCK+Upgrade)\n");
 
-        /* ---- UNLOCK/GET com Upgrade: websocket → 101 ---- */
-        case REQ_TUNNEL_UPGRADE:
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 101 %s\r\n"
-                     "Connection: Upgrade\r\n"
-                     "Upgrade: websocket\r\n\r\n",
-                     status);
-            if (write(client_sock, resp, strlen(resp)) <= 0)
-                { close(client_sock); return; }
-            fprintf(stderr, "[resp] 101 Upgrade\n");
-            break;
+        /* Passo 3: lê o UNLOCK + Content-Length: 9999... */
+        n = read_http_request(client_sock, req, sizeof(req));
+        if (n <= 0) { close(client_sock); return; }
+        fprintf(stderr, "[req3] %.60s\n", req);
 
-        /* ---- UNLOCK com Content-Length gigante → 200 + abre túnel ---- */
-        case REQ_TUNNEL_OPEN:
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n"
-                     "Content-Length: 0\r\n\r\n",
-                     status);
-            if (write(client_sock, resp, strlen(resp)) <= 0)
-                { close(client_sock); return; }
-            fprintf(stderr, "[resp] 200 OK → TÚNEL ABERTO (%d respostas enviadas)\n",
-                    req_count);
-            goto open_tunnel;
+        /* Responde com 200 OK — abre o túnel */
+        status = get_random_status();
+        snprintf(resp, sizeof(resp),
+                 "HTTP/1.1 200 OK %s\r\n"
+                 "Content-Length: 0\r\n\r\n",
+                 status);
+        if (write(client_sock, resp, strlen(resp)) <= 0)
+            { close(client_sock); return; }
+        fprintf(stderr, "[resp] 200 OK (UNLOCK+C-Length) — túnel aberto\n");
 
-        /* ---- proxyc:on → duplo 200 + abre túnel ---- */
-        case REQ_PROXYC:
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
-            write(client_sock, resp, strlen(resp));
-            fprintf(stderr, "[resp] duplo 200 (proxyc) → TÚNEL ABERTO\n");
-            goto open_tunnel;
+    /* ============================================================
+     * MODO PROXYC (duplo 200)
+     * ============================================================ */
+    } else if (is_proxyc) {
+        fprintf(stderr, "[modo] PROXYC\n");
+        status = get_random_status();
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+        write(client_sock, resp, strlen(resp));
 
-        default:
-            /* Request não reconhecido: responde 200 e continua */
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n"
-                     "Content-Length: 0\r\n\r\n",
-                     status);
-            if (write(client_sock, resp, strlen(resp)) <= 0)
-                { close(client_sock); return; }
-            break;
-        }
+    /* ============================================================
+     * MODO PADRÃO (CONNECT/UNLOCK direto → 101 + 200)
+     * ============================================================ */
+    } else {
+        fprintf(stderr, "[modo] DEFAULT (method=%s)\n",
+                is_unlock ? "UNLOCK" : "OTHER");
 
-        /*
-         * Segurança: se enviamos mais respostas do que o dobro da
-         * lista de status e nenhum gatilho de túnel apareceu,
-         * algo está errado — evita loop infinito.
-         */
-        if (req_count > status_count * 2 + 8) {
-            fprintf(stderr, "[loop] excedeu limite de requests (%d), encerrando\n",
-                    req_count);
-            close(client_sock);
-            return;
-        }
+        status = get_random_status();
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+
+        /* Lê o próximo request antes do 200 */
+        n = read_http_request(client_sock, req, sizeof(req));
+        if (n <= 0) { close(client_sock); return; }
+
+        status = get_random_status();
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
     }
 
-open_tunnel:
     /* ----------------------------------------------------------------
-     * Detecta o backend:
-     * Peek do próximo payload (dados SSH/VPN reais).
-     * SSH não envia nada imediatamente (espera banner) → timeout
-     * é normal e o fallback (porta 22) cobre esse caso.
+     * Detecta backend via peek do próximo payload (dados do túnel).
+     * SSH não envia nada imediatamente (espera banner) — timeout
+     * é normal e o fallback cobre esse caso.
      * ---------------------------------------------------------------- */
-    {
-        char peek[BUFFER_SIZE] = {0};
-        int  peek_n = peek_data(client_sock, peek, sizeof(peek));
-        BackendRule *backend = detect_backend(peek, peek_n);
-        fprintf(stderr, "[backend] %s:%d (peek=%d bytes)\n",
-                backend->host, backend->port, peek_n);
+    char peek[BUFFER_SIZE] = {0};
+    int  peek_n = peek_data(client_sock, peek, sizeof(peek));
+    BackendRule *backend = detect_backend(peek, peek_n);
 
-        int server_sock = connect_backend(backend->host, backend->port);
-        if (server_sock < 0) { close(client_sock); return; }
+    fprintf(stderr, "[backend] %s:%d\n", backend->host, backend->port);
 
-        pthread_t t1, t2;
-        int *c2s = malloc(2 * sizeof(int));
-        int *s2c = malloc(2 * sizeof(int));
-        c2s[0] = client_sock; c2s[1] = server_sock;
-        s2c[0] = server_sock; s2c[1] = client_sock;
+    int server_sock = connect_backend(backend->host, backend->port);
+    if (server_sock < 0) { close(client_sock); return; }
 
-        pthread_create(&t1, NULL, transfer, c2s);
-        pthread_create(&t2, NULL, transfer, s2c);
-        pthread_join(t1, NULL);
-        pthread_join(t2, NULL);
+    pthread_t t1, t2;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
-        close(client_sock);
-        close(server_sock);
-    }
+    pthread_create(&t1, NULL, transfer, c2s);
+    pthread_create(&t2, NULL, transfer, s2c);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    close(client_sock);
+    close(server_sock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -469,13 +415,9 @@ static void accept_loop(int server_sock) {
 
         char ip[INET6_ADDRSTRLEN] = {0};
         if (client_addr.ss_family == AF_INET6)
-            inet_ntop(AF_INET6,
-                      &((struct sockaddr_in6*)&client_addr)->sin6_addr,
-                      ip, sizeof(ip));
+            inet_ntop(AF_INET6, &((struct sockaddr_in6*)&client_addr)->sin6_addr, ip, sizeof(ip));
         else
-            inet_ntop(AF_INET,
-                      &((struct sockaddr_in *)&client_addr)->sin_addr,
-                      ip, sizeof(ip));
+            inet_ntop(AF_INET,  &((struct sockaddr_in *)&client_addr)->sin_addr,  ip, sizeof(ip));
         fprintf(stderr, "[+] %s\n", ip);
 
         pid_t pid = fork();
@@ -498,13 +440,11 @@ int main(int argc, char *argv[]) {
     saved_argv = argv;
     parse_args(argc, argv);
 
-    struct sigaction sa_hup  = {0};
-    sa_hup.sa_handler = handle_sighup;
+    struct sigaction sa_hup  = {0}; sa_hup.sa_handler  = handle_sighup;
     sigaction(SIGHUP, &sa_hup, NULL);
 
-    struct sigaction sa_chld = {0};
-    sa_chld.sa_handler = handle_sigchld;
-    sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
+    struct sigaction sa_chld = {0}; sa_chld.sa_handler = handle_sigchld;
+    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
@@ -519,10 +459,8 @@ int main(int argc, char *argv[]) {
     addr.sin6_port   = htons(PORT);
     addr.sin6_addr   = in6addr_any;
 
-    if (bind(server_sock,   (struct sockaddr *)&addr, sizeof(addr)) < 0)
-        { perror("bind");   return 1; }
-    if (listen(server_sock, 256) < 0)
-        { perror("listen"); return 1; }
+    if (bind(server_sock,   (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind");   return 1; }
+    if (listen(server_sock, 256) < 0)                                     { perror("listen"); return 1; }
 
     printf("ProxyC porta %d (IPv4+IPv6) | status=%d | backends=%d\n",
            PORT, CONFIG.status_count, CONFIG.backend_count);
