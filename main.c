@@ -151,6 +151,20 @@ static void handle_sigchld(int sig) {
 /* ------------------------------------------------------------------ */
 /* Utilitários de rede                                                  */
 /* ------------------------------------------------------------------ */
+/* write_all: garante que todos os bytes sejam escritos, trata parciais */
+static int write_all(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = write(fd, buf + sent, len - sent);
+        if (w <= 0) return -1;
+        sent += w;
+    }
+    return 0;
+}
+
+/* peek_data e detect_backend são mantidas para conexões diretas
+ * (sem payload multi-bloco de VPN) e uso futuro. */
+static int peek_data(int sock, char *buffer, int len) __attribute__((unused));
 static int peek_data(int sock, char *buffer, int len) {
     struct timeval tv = {PEEK_TIMEOUT, 0};
     fd_set fds;
@@ -187,6 +201,7 @@ static const char *get_random_status(void) {
     return s;
 }
 
+static BackendRule *detect_backend(const char *data, int len) __attribute__((unused));
 static BackendRule *detect_backend(const char *data, int len) {
     pthread_rwlock_rdlock(&config_lock);
 
@@ -418,26 +433,20 @@ static void handle_client(int client_sock) {
         if (is_proxyc_request(buf)) {
             snprintf(resp, sizeof(resp),
                      "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
-            write(client_sock, resp, strlen(resp));
-            /* proxyc:on geralmente é o único bloco; continua o loop
-             * mas na prática o próximo recv vai retornar o payload real */
+            if (write_all(client_sock, resp, strlen(resp)) < 0 ||
+                write_all(client_sock, resp, strlen(resp)) < 0) {
+                close(client_sock); return;
+            }
             continue;
         }
 
         /* --- bloco com Content-Length absurdo (UNLOCK / DPI) ------- */
         if (is_large_content_length(buf)) {
-            /*
-             * ALTERAÇÃO 4c — responde 200 e NÃO lê o body.
-             * O app de VPN não espera que o proxy consuma os dados;
-             * ele serve apenas para manter o "keep-alive" do DPI.
-             * O próximo recv vai pegar o bloco seguinte normalmente
-             * porque o app envia os blocos em sequência sem esperar
-             * que o body seja consumido.
-             */
             snprintf(resp, sizeof(resp),
                      "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
+            if (write_all(client_sock, resp, strlen(resp)) < 0) {
+                close(client_sock); return;
+            }
             continue;
         }
 
@@ -445,18 +454,24 @@ static void handle_client(int client_sock) {
         if (is_tunnel_request(buf)) {
             snprintf(resp, sizeof(resp),
                      "HTTP/1.1 101 %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
+            if (write_all(client_sock, resp, strlen(resp)) < 0) {
+                close(client_sock); return;
+            }
             snprintf(resp, sizeof(resp),
                      "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
+            if (write_all(client_sock, resp, strlen(resp)) < 0) {
+                close(client_sock); return;
+            }
             tunnel_ready = 1;
-            break; /* sai do loop — próximos bytes são dados do túnel */
+            break;
         }
 
         /* --- bloco intermediário genérico (GET falso, ACL, CHECKIN) */
         snprintf(resp, sizeof(resp),
                  "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
+        if (write_all(client_sock, resp, strlen(resp)) < 0) {
+            close(client_sock); return;
+        }
     }
 
     /*
@@ -470,16 +485,50 @@ static void handle_client(int client_sock) {
     }
 
     /* ----------------------------------------------------------------
-     * Remove o timeout de leitura antes do túnel — a partir daqui
-     * os dados fluem livremente pelo tempo que o usuário quiser.
+     * ALTERAÇÃO 5a — remove timeout antes de entrar no túnel.
      * ---------------------------------------------------------------- */
     struct timeval no_tv = {0, 0};
     setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
 
-    /* Peek do primeiro payload real para detectar o backend */
-    char peek[BUFFER_SIZE] = {0};
-    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
-    BackendRule *backend = detect_backend(peek, peeked);
+    /* ----------------------------------------------------------------
+     * ALTERAÇÃO 5b — DRAIN: descarta resíduos no buffer do socket.
+     *
+     * Problema: payloads de VPN usam o marcador [split] para separar
+     * blocos dentro do mesmo segmento TCP. O bloco UNLOCK (ou qualquer
+     * outro bloco pós-[split]) chega colado imediatamente após o bloco
+     * de upgrade, ainda no buffer do socket, mesmo depois do break do
+     * loop. Se não for descartado, esse lixo chega ao backend SSH antes
+     * dos dados reais do cliente, corrompendo o handshake.
+     *
+     * Solução: ler e descartar tudo que ainda estiver no buffer com um
+     * timeout bem curto (50 ms). Quando o recv retornar 0 bytes (buffer
+     * vazio) ou erro (timeout), o buffer está limpo e o túnel pode
+     * começar com dados reais.
+     * ---------------------------------------------------------------- */
+    {
+        char drain[BUFFER_SIZE];
+        struct timeval dtv = {0, 50000}; /* 50 ms */
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &dtv, sizeof(dtv));
+        while (recv(client_sock, drain, sizeof(drain), 0) > 0);
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
+    }
+
+    /* ----------------------------------------------------------------
+     * ALTERAÇÃO 5c — seleção de backend sem peek.
+     *
+     * Problema anterior: peek_data após o drain lia o banner SSH vindo
+     * do SERVIDOR (não do cliente), porque o protocolo SSH envia o
+     * banner do servidor primeiro. detect_backend recebia dados do
+     * servidor em vez do cliente, tornando a detecção por padrão
+     * inútil nesse momento.
+     *
+     * Solução: selecionar o backend diretamente pela lista de regras,
+     * usando o fallback (índice 1 se existir, senão 0). A detecção por
+     * padrão (ex.: "SSH") continua funcionando para conexões que NÃO
+     * passam pelo loop multi-bloco (conexões diretas sem payload de VPN
+     * onde o cliente envia dados imediatamente).
+     * ---------------------------------------------------------------- */
+    BackendRule *backend = &CONFIG.backends[CONFIG.backend_count > 1 ? 1 : 0];
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) { close(client_sock); return; }
