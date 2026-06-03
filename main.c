@@ -16,23 +16,11 @@
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE         65536
-#define PEEK_TIMEOUT        1
-#define CONNECT_TIMEOUT     5
-#define MAX_STATUS          32
-#define MAX_BACKEND         32
-
-/*
- * ALTERAÇÃO 1 — novo limite de blocos por requisição e timeout de leitura.
- *
- * MAX_BLOCKS: quantidade máxima de blocos HTTP falsos que o proxy aceita
- * por conexão antes de desistir. Payloads de VPN raramente passam de 8.
- *
- * BLOCK_RECV_TIMEOUT: tempo máximo (segundos) para receber cada bloco.
- * Evita que uma conexão malformada trave o processo filho indefinidamente.
- */
-#define MAX_BLOCKS          16
-#define BLOCK_RECV_TIMEOUT  10
+#define BUFFER_SIZE      65536  /* aumentado de 4096 para melhor throughput */
+#define PEEK_TIMEOUT     1
+#define CONNECT_TIMEOUT  5      /* segundos máximos para connect() ao backend */
+#define MAX_STATUS       32
+#define MAX_BACKEND      32
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
@@ -57,10 +45,12 @@ static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
 static ProxyConfig       CONFIG         = {0};
 
+/* Reload via SIGHUP */
 static volatile sig_atomic_t  reload_flag  = 0;
 static int                    saved_argc   = 0;
 static char                 **saved_argv   = NULL;
 
+/* Proteção de leitura/escrita da CONFIG durante reload */
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
@@ -113,6 +103,7 @@ static void parse_args(int argc, char *argv[]) {
         }
     }
 
+    /* Defaults se nada foi passado */
     if (new_cfg.backend_count == 0) {
         strcpy(new_cfg.backends[0].pattern, "SSH");
         strcpy(new_cfg.backends[0].host,    "0.0.0.0");
@@ -127,6 +118,7 @@ static void parse_args(int argc, char *argv[]) {
         new_cfg.status_count  = 1;
     }
 
+    /* Troca atômica da configuração */
     pthread_rwlock_wrlock(&config_lock);
     free_config(&CONFIG);
     CONFIG         = new_cfg;
@@ -138,11 +130,19 @@ static void parse_args(int argc, char *argv[]) {
 /* ------------------------------------------------------------------ */
 /* Handlers de sinal                                                    */
 /* ------------------------------------------------------------------ */
+
+/*
+ * SIGHUP: sinaliza reload. accept() retornará EINTR (SA_RESTART desligado)
+ * e o loop principal verificará reload_flag antes do próximo accept.
+ */
 static void handle_sighup(int sig) {
     (void)sig;
     reload_flag = 1;
 }
 
+/*
+ * SIGCHLD: recolhe processos filhos zumbis sem bloquear.
+ */
 static void handle_sigchld(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -160,6 +160,10 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
+/*
+ * Transfere dados de fds[0] → fds[1] em loop (trata writes parciais).
+ * Não fecha os fds — isso fica a cargo do processo pai após o join.
+ */
 static void *transfer(void *arg) {
     int    *fds = (int *)arg;
     char    buf[BUFFER_SIZE];
@@ -212,8 +216,13 @@ static BackendRule *detect_backend(const char *data, int len) {
 }
 
 /* ------------------------------------------------------------------ */
-/* connect_backend — timeout + IPv4/IPv6                               */
+/* MELHORIA 1 — connect() ao backend com timeout + suporte IPv4/IPv6   */
 /* ------------------------------------------------------------------ */
+/*
+ * Cria um socket para o backend detectando automaticamente se o host
+ * é um endereço IPv4 ou IPv6. Usa O_NONBLOCK + select() para garantir
+ * que a tentativa de conexão não bloqueie mais que CONNECT_TIMEOUT s.
+ */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr    = {0};
     socklen_t               saddr_len;
@@ -222,6 +231,7 @@ static int connect_backend(const char *host, int port) {
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
+    /* Tenta interpretar o host como IPv6 primeiro, depois IPv4 */
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
         family          = AF_INET6;
         s6->sin6_family = AF_INET6;
@@ -240,6 +250,7 @@ static int connect_backend(const char *host, int port) {
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("[backend] socket"); return -1; }
 
+    /* Coloca em modo não-bloqueante para aplicar o timeout */
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -251,6 +262,7 @@ static int connect_backend(const char *host, int port) {
     }
 
     if (r != 0) {
+        /* Aguarda o socket ficar gravável ou o timeout expirar */
         fd_set         wfds;
         struct timeval tv = {CONNECT_TIMEOUT, 0};
         FD_ZERO(&wfds);
@@ -263,6 +275,7 @@ static int connect_backend(const char *host, int port) {
             return -1;
         }
 
+        /* Verifica se o connect realmente teve êxito */
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
@@ -274,213 +287,50 @@ static int connect_backend(const char *host, int port) {
         }
     }
 
+    /* Restaura modo bloqueante para o uso normal de I/O */
     fcntl(sock, F_SETFL, flags);
     return sock;
 }
 
 /* ------------------------------------------------------------------ */
-/* ALTERAÇÃO 2 — read_http_block                                       */
-/*                                                                      */
-/* Lê do socket byte a byte até encontrar um terminador de bloco HTTP: */
-/*   \r\n\r\n  (padrão RFC)                                            */
-/*   \n\n      (usado por alguns apps de VPN)                          */
-/*                                                                      */
-/* Retorna o número de bytes lidos (sem o terminador) ou 0/negativo    */
-/* em caso de erro/fechamento de conexão.                               */
-/*                                                                      */
-/* Por que byte a byte e não recv de uma vez?                           */
-/* Payloads de VPN chegam em chunks irregulares e o limite do bloco    */
-/* não é um Content-Length declarado — é literalmente a sequência      */
-/* \r\n\r\n ou \n\n. Ler byte a byte garante que não "comemos" bytes   */
-/* do próximo bloco ou do payload de dados real que vem depois.        */
-/* ------------------------------------------------------------------ */
-static int read_http_block(int sock, char *buf, int maxlen) {
-    int total = 0;
-
-    while (total < maxlen - 1) {
-        char c;
-        ssize_t n = recv(sock, &c, 1, 0);
-        if (n <= 0) break;          /* conexão fechada ou erro */
-
-        buf[total++] = c;
-        buf[total]   = '\0';
-
-        /* Terminador \r\n\r\n */
-        if (total >= 4 && memcmp(buf + total - 4, "\r\n\r\n", 4) == 0) break;
-        /* Terminador \n\n (apps que omitem o CR) */
-        if (total >= 2 && memcmp(buf + total - 2, "\n\n",     2) == 0) break;
-    }
-
-    return total;
-}
-
-/* ------------------------------------------------------------------ */
-/* ALTERAÇÃO 3 — classificadores de bloco                              */
-/*                                                                      */
-/* is_tunnel_request: retorna 1 se o bloco indica que é o último da   */
-/* sequência e que o cliente quer iniciar um túnel (upgrade).          */
-/* Critérios:                                                           */
-/*   - Cabeçalho "Upgrade:" ou "upgrade:" presente                     */
-/*   - Método CONNECT (usado por alguns configs de HTTP Injector)      */
-/*                                                                      */
-/* is_proxyc_request: detecta o marcador proprietário proxyc:on que   */
-/* pede resposta dupla 200.                                             */
-/*                                                                      */
-/* is_large_content_length: detecta blocos com Content-Length absurdo  */
-/* (como 9999999999999) que servem apenas para enganar DPI. O proxy    */
-/* responde 200 e segue para o próximo bloco sem tentar ler o body.    */
-/* ------------------------------------------------------------------ */
-static int is_tunnel_request(const char *buf) {
-    /* Upgrade: websocket / Upgrade: TCP etc. */
-    if (strstr(buf, "Upgrade:")  || strstr(buf, "upgrade:"))  return 1;
-    /* Método CONNECT puro */
-    if (strncmp(buf, "CONNECT ", 8) == 0)                     return 1;
-    return 0;
-}
-
-static int is_proxyc_request(const char *buf) {
-    return (strstr(buf, "proxyc:on") || strstr(buf, "proxyc: on")) ? 1 : 0;
-}
-
-static int is_large_content_length(const char *buf) {
-    /*
-     * Procura "Content-Length:" (case-insensitive aproximado) e verifica
-     * se o valor é maior que 1 GB (sinal de payload sintético de DPI).
-     */
-    const char *p = strstr(buf, "Content-Length:");
-    if (!p) p = strstr(buf, "content-length:");
-    if (!p) return 0;
-    p += 15; /* pula "Content-Length:" */
-    while (*p == ' ') p++;
-    long long val = atoll(p);
-    return (val > 1073741824LL) ? 1 : 0; /* > 1 GB → sintético */
-}
-
-/* ------------------------------------------------------------------ */
-/* ALTERAÇÃO 4 — handle_client refatorada                              */
-/*                                                                      */
-/* Antes: lia exatamente um bloco via peek + recv e abria o túnel.     */
-/* Agora: loop que processa N blocos HTTP até encontrar o bloco de     */
-/* upgrade/tunnel, respondendo adequadamente a cada um.                 */
-/*                                                                      */
-/* Fluxo por tipo de bloco:                                             */
-/*                                                                      */
-/*  1. proxyc:on                                                        */
-/*     → responde 200 duplo (comportamento original mantido)           */
-/*     → consome o bloco e continua o loop                             */
-/*                                                                      */
-/*  2. Content-Length gigante (blocos UNLOCK / payload DPI)            */
-/*     → responde 200 simples                                           */
-/*     → NÃO tenta ler o body — segue para o próximo bloco             */
-/*                                                                      */
-/*  3. Bloco de upgrade/tunnel (último bloco real)                     */
-/*     → responde 101 + 200 (handshake de upgrade)                     */
-/*     → sai do loop e abre o túnel bidirecional                       */
-/*                                                                      */
-/*  4. Qualquer outro bloco intermediário (GET falso, ACL, CHECKIN...) */
-/*     → responde 200 simples e continua lendo                         */
-/*                                                                      */
-/* O timeout SO_RCVTIMEO (BLOCK_RECV_TIMEOUT segundos) é aplicado ao  */
-/* socket antes do loop para evitar que processos filhos fiquem presos */
-/* esperando dados que nunca chegam.                                    */
+/* Tratamento do cliente                                                */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
-    /*
-     * ALTERAÇÃO 4a — aplica timeout de leitura no socket do cliente.
-     * Sem isso, um app que envie apenas parte do payload e pare
-     * travaria o processo filho para sempre.
-     */
-    struct timeval tv = {BLOCK_RECV_TIMEOUT, 0};
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char        buf[BUFFER_SIZE] = {0};
+    char        resp[256];
+    const char *status = get_random_status();
 
-    char buf[BUFFER_SIZE];
-    char resp[256];
-    int  blocks_processed = 0;
-    int  tunnel_ready     = 0;
+    /* Peek do request para detectar o header especial */
+    peek_data(client_sock, buf, sizeof(buf) - 1);
+    int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
+                     (strstr(buf, "proxyc: on") != NULL);
 
-    /* ----------------------------------------------------------------
-     * ALTERAÇÃO 4b — loop de blocos HTTP
-     * ---------------------------------------------------------------- */
-    while (blocks_processed < MAX_BLOCKS) {
-        memset(buf, 0, sizeof(buf));
-        int len = read_http_block(client_sock, buf, sizeof(buf));
-
-        if (len <= 0) {
-            /* conexão fechada ou timeout antes de qualquer dado útil */
-            close(client_sock);
-            return;
+    if (has_proxyc) {
+        /* Modo proxyc:on → duplo 200 */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+        write(client_sock, resp, strlen(resp));
+        /* Consome o request da fila */
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
         }
-
-        blocks_processed++;
-        const char *status = get_random_status();
-
-        /* --- proxyc:on -------------------------------------------- */
-        if (is_proxyc_request(buf)) {
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
-            write(client_sock, resp, strlen(resp));
-            /* proxyc:on geralmente é o único bloco; continua o loop
-             * mas na prática o próximo recv vai retornar o payload real */
-            continue;
+    } else {
+        /* Modo padrão → 101 → consome request → 200 */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
         }
-
-        /* --- bloco com Content-Length absurdo (UNLOCK / DPI) ------- */
-        if (is_large_content_length(buf)) {
-            /*
-             * ALTERAÇÃO 4c — responde 200 e NÃO lê o body.
-             * O app de VPN não espera que o proxy consuma os dados;
-             * ele serve apenas para manter o "keep-alive" do DPI.
-             * O próximo recv vai pegar o bloco seguinte normalmente
-             * porque o app envia os blocos em sequência sem esperar
-             * que o body seja consumido.
-             */
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
-            continue;
-        }
-
-        /* --- bloco de upgrade/tunnel (último da sequência) --------- */
-        if (is_tunnel_request(buf)) {
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 101 %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
-            snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
-            tunnel_ready = 1;
-            break; /* sai do loop — próximos bytes são dados do túnel */
-        }
-
-        /* --- bloco intermediário genérico (GET falso, ACL, CHECKIN) */
-        snprintf(resp, sizeof(resp),
-                 "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    /*
-     * ALTERAÇÃO 4d — se saímos do loop sem um bloco de tunnel
-     * (ex.: app enviou apenas blocos intermediários e fechou, ou
-     * atingimos MAX_BLOCKS), encerra a conexão sem abrir túnel.
-     */
-    if (!tunnel_ready) {
-        close(client_sock);
-        return;
-    }
-
-    /* ----------------------------------------------------------------
-     * Remove o timeout de leitura antes do túnel — a partir daqui
-     * os dados fluem livremente pelo tempo que o usuário quiser.
-     * ---------------------------------------------------------------- */
-    struct timeval no_tv = {0, 0};
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
-
-    /* Peek do primeiro payload real para detectar o backend */
+    /* Peek do próximo payload para escolher o backend */
     char peek[BUFFER_SIZE] = {0};
     int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, peeked);
 
+    /* MELHORIA 1: connect com timeout e suporte IPv4/IPv6 */
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) { close(client_sock); return; }
 
@@ -498,13 +348,16 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* accept_loop                                                          */
+/* MELHORIA 4 — accept_loop sem thread wrapper (chamado direto do main) */
+/* MELHORIA 3 — verifica reload_flag antes de cada accept()            */
+/* MELHORIA 2 — aceita clientes IPv4 e IPv6 via sockaddr_storage       */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
     socklen_t               client_len = sizeof(client_addr);
 
     while (1) {
+        /* MELHORIA 3: reload de config via SIGHUP sem reiniciar o processo */
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
@@ -517,11 +370,12 @@ static void accept_loop(int server_sock) {
                                  (struct sockaddr *)&client_addr,
                                  &client_len);
         if (client_sock < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; /* sinal recebido — testa reload_flag */
             perror("accept");
             continue;
         }
 
+        /* Log do IP do cliente — MELHORIA 2: suporta IPv4 e IPv6 */
         char client_ip[INET6_ADDRSTRLEN] = {0};
         if (client_addr.ss_family == AF_INET6) {
             inet_ntop(AF_INET6,
@@ -540,10 +394,12 @@ static void accept_loop(int server_sock) {
             continue;
         }
         if (pid == 0) {
+            /* Processo filho */
             close(server_sock);
             handle_client(client_sock);
             exit(0);
         }
+        /* Processo pai */
         close(client_sock);
     }
 }
@@ -553,21 +409,30 @@ static void accept_loop(int server_sock) {
 /* ------------------------------------------------------------------ */
 int main(int argc, char *argv[]) {
     srand(time(NULL));
+
+    /* Ignora SIGPIPE: evita crash em writes para sockets fechados */
     signal(SIGPIPE, SIG_IGN);
 
+    /* Salva args para uso no reload via SIGHUP */
     saved_argc = argc;
     saved_argv = argv;
     parse_args(argc, argv);
 
+    /* MELHORIA 3: instala handler de SIGHUP para reload sem restart.
+     * SA_RESTART desligado → accept() retorna EINTR ao receber SIGHUP,
+     * permitindo que o loop verifique reload_flag imediatamente.         */
     struct sigaction sa_hup = {0};
     sa_hup.sa_handler = handle_sighup;
     sigaction(SIGHUP, &sa_hup, NULL);
 
+    /* Recolhe processos filhos zumbis automaticamente */
     struct sigaction sa_chld = {0};
     sa_chld.sa_handler = handle_sigchld;
     sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
+    /* MELHORIA 2: socket AF_INET6 com IPV6_V6ONLY = 0
+     * → aceita conexões IPv4 (como ::ffff:x.x.x.x) e IPv6 no mesmo fd. */
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
     if (server_sock < 0) { perror("socket"); return 1; }
 
@@ -594,6 +459,7 @@ int main(int argc, char *argv[]) {
            PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
 
+    /* MELHORIA 4: accept_loop chamado diretamente — sem thread wrapper */
     accept_loop(server_sock);
 
     pthread_rwlock_destroy(&config_lock);
