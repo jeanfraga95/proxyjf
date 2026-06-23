@@ -12,17 +12,15 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <netinet/tcp.h>
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      262144  /* Aumentado para 256KB para melhor throughput em vídeos */
-#define PEEK_TIMEOUT     5       /* Aumentado para 5 segundos para lidar com pausas em streaming */
-#define CONNECT_TIMEOUT  10      /* Aumentado para 10 segundos para conexões lentas */
+#define BUFFER_SIZE      25536  /* aumentado de 4096 para melhor throughput */
+#define PEEK_TIMEOUT     5
+#define CONNECT_TIMEOUT  10      /* segundos máximos para connect() ao backend */
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
-#define MAX_RETRIES      3       /* Número de tentativas para operações de I/O */
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
@@ -54,10 +52,6 @@ static char                 **saved_argv   = NULL;
 
 /* Proteção de leitura/escrita da CONFIG durante reload */
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
-
-/* Estatísticas para debug */
-static volatile unsigned long total_bytes_transferred = 0;
-static volatile unsigned long active_connections = 0;
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -136,11 +130,19 @@ static void parse_args(int argc, char *argv[]) {
 /* ------------------------------------------------------------------ */
 /* Handlers de sinal                                                    */
 /* ------------------------------------------------------------------ */
+
+/*
+ * SIGHUP: sinaliza reload. accept() retornará EINTR (SA_RESTART desligado)
+ * e o loop principal verificará reload_flag antes do próximo accept.
+ */
 static void handle_sighup(int sig) {
     (void)sig;
     reload_flag = 1;
 }
 
+/*
+ * SIGCHLD: recolhe processos filhos zumbis sem bloquear.
+ */
 static void handle_sigchld(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -158,91 +160,26 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
-/* 
- * CORREÇÃO 1: Função de transferência melhorada com:
- * - Non-blocking I/O para evitar deadlocks
- * - Timeout para operações bloqueantes
- * - Tratamento correto de EAGAIN/EWOULDBLOCK
- * - Estatísticas de transferência
- * - Não faz shutdown prematuro
+/*
+ * Transfere dados de fds[0] → fds[1] em loop (trata writes parciais).
+ * Não fecha os fds — isso fica a cargo do processo pai após o join.
  */
 static void *transfer(void *arg) {
-    int *fds = (int *)arg;
-    char *buf = malloc(BUFFER_SIZE);
-    if (!buf) {
-        free(fds);
-        return NULL;
-    }
+    int    *fds = (int *)arg;
+    char    buf[BUFFER_SIZE];
+    ssize_t bytes;
 
-    /* Configura sockets para non-blocking */
-    int flags_in = fcntl(fds[0], F_GETFL, 0);
-    fcntl(fds[0], F_SETFL, flags_in | O_NONBLOCK);
-    int flags_out = fcntl(fds[1], F_GETFL, 0);
-    fcntl(fds[1], F_SETFL, flags_out | O_NONBLOCK);
-
-    fd_set readfds;
-    struct timeval tv;
-    ssize_t bytes, sent;
-    unsigned long total = 0;
-    int retry_count = 0;
-
-    while (1) {
-        FD_ZERO(&readfds);
-        FD_SET(fds[0], &readfds);
-        
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-
-        int ready = select(fds[0] + 1, &readfds, NULL, NULL, &tv);
-        
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            break;
-        } else if (ready == 0) {
-            /* Timeout - verifica se ainda há dados pendentes */
-            retry_count++;
-            if (retry_count > MAX_RETRIES) break;
-            continue;
-        }
-
-        retry_count = 0;
-
-        if (FD_ISSET(fds[0], &readfds)) {
-            bytes = read(fds[0], buf, BUFFER_SIZE);
-            if (bytes <= 0) {
-                if (bytes == 0 || errno != EAGAIN) break;
-                continue;
-            }
-
-            total += bytes;
-            sent = 0;
-            
-            while (sent < bytes) {
-                ssize_t w = write(fds[1], buf + sent, bytes - sent);
-                if (w <= 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        usleep(1000);
-                        continue;
-                    }
-                    goto done;
-                }
-                sent += w;
-            }
-
-            /* Log a cada 10MB para debugging */
-            if (total % (10 * 1024 * 1024) < (size_t)bytes) {
-                fprintf(stderr, "[transfer] %lu MB transferred\n", total / (1024*1024));
-            }
+    while ((bytes = read(fds[0], buf, BUFFER_SIZE)) > 0) {
+        ssize_t sent = 0;
+        while (sent < bytes) {
+            ssize_t w = write(fds[1], buf + sent, bytes - sent);
+            if (w <= 0) goto done;
+            sent += w;
         }
     }
-
 done:
-    /* CORREÇÃO: Não faz shutdown do lado de leitura, apenas do escrita */
     shutdown(fds[1], SHUT_WR);
-    
-    __sync_fetch_and_add(&total_bytes_transferred, total);
-    
-    free(buf);
+    shutdown(fds[0], SHUT_RD);
     free(fds);
     return NULL;
 }
@@ -279,8 +216,13 @@ static BackendRule *detect_backend(const char *data, int len) {
 }
 
 /* ------------------------------------------------------------------ */
-/* connect() ao backend com timeout + suporte IPv4/IPv6                */
+/* MELHORIA 1 — connect() ao backend com timeout + suporte IPv4/IPv6   */
 /* ------------------------------------------------------------------ */
+/*
+ * Cria um socket para o backend detectando automaticamente se o host
+ * é um endereço IPv4 ou IPv6. Usa O_NONBLOCK + select() para garantir
+ * que a tentativa de conexão não bloqueie mais que CONNECT_TIMEOUT s.
+ */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr    = {0};
     socklen_t               saddr_len;
@@ -289,6 +231,7 @@ static int connect_backend(const char *host, int port) {
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
+    /* Tenta interpretar o host como IPv6 primeiro, depois IPv4 */
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
         family          = AF_INET6;
         s6->sin6_family = AF_INET6;
@@ -307,10 +250,7 @@ static int connect_backend(const char *host, int port) {
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("[backend] socket"); return -1; }
 
-    /* CORREÇÃO: Ativa TCP_NODELAY para reduzir latência em streaming */
-    int flag = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
+    /* Coloca em modo não-bloqueante para aplicar o timeout */
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -322,6 +262,7 @@ static int connect_backend(const char *host, int port) {
     }
 
     if (r != 0) {
+        /* Aguarda o socket ficar gravável ou o timeout expirar */
         fd_set         wfds;
         struct timeval tv = {CONNECT_TIMEOUT, 0};
         FD_ZERO(&wfds);
@@ -334,6 +275,7 @@ static int connect_backend(const char *host, int port) {
             return -1;
         }
 
+        /* Verifica se o connect realmente teve êxito */
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
@@ -345,123 +287,77 @@ static int connect_backend(const char *host, int port) {
         }
     }
 
+    /* Restaura modo bloqueante para o uso normal de I/O */
     fcntl(sock, F_SETFL, flags);
     return sock;
 }
 
 /* ------------------------------------------------------------------ */
-/* CORREÇÃO 2: Tratamento do cliente completamente reescrito          */
+/* Tratamento do cliente                                                */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
-    char        resp[512];
+    char        resp[256];
     const char *status = get_random_status();
-    int         request_len;
-    
-    __sync_fetch_and_add(&active_connections, 1);
 
-    /* CORREÇÃO: Lê o request completo primeiro */
-    request_len = recv(client_sock, buf, BUFFER_SIZE - 1, 0);
-    if (request_len <= 0) {
-        close(client_sock);
-        __sync_fetch_and_sub(&active_connections, 1);
-        return;
-    }
-    buf[request_len] = '\0';
-
-    /* CORREÇÃO: Log do request para debug */
-    fprintf(stderr, "[client] Request recebido: %d bytes\n", request_len);
-
-    /* Detecta proxyc no request original */
-    int has_proxyc = (strstr(buf, "proxyc:on") != NULL) ||
+    /* Peek do request para detectar o header especial */
+    peek_data(client_sock, buf, sizeof(buf) - 1);
+    int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
-    /* CORREÇÃO: Envia respostas com base no request original */
     if (has_proxyc) {
+        /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
+        /* Consome o request da fila */
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
+        }
     } else {
+        /* Modo padrão → 101 → consome request → 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        /* Pequena pausa para garantir que o 101 foi enviado */
-        usleep(10000);
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
+        }
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    /* CORREÇÃO: Detecta backend baseado no request original, não no peek */
-    BackendRule *backend = detect_backend(buf, request_len);
-    fprintf(stderr, "[client] Backend selecionado: %s:%d (pattern: %s)\n", 
-            backend->host, backend->port, backend->pattern);
+    /* Peek do próximo payload para escolher o backend */
+    char peek[BUFFER_SIZE] = {0};
+    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
+    BackendRule *backend = detect_backend(peek, peeked);
 
-    /* Conecta ao backend */
+    /* MELHORIA 1: connect com timeout e suporte IPv4/IPv6 */
     int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) {
-        fprintf(stderr, "[client] Falha ao conectar ao backend\n");
-        close(client_sock);
-        __sync_fetch_and_sub(&active_connections, 1);
-        return;
-    }
+    if (server_sock < 0) { close(client_sock); return; }
 
-    /* CORREÇÃO: Envia o request original para o backend */
-    ssize_t sent = 0;
-    while (sent < request_len) {
-        ssize_t w = write(server_sock, buf + sent, request_len - sent);
-        if (w <= 0) {
-            fprintf(stderr, "[client] Falha ao enviar request ao backend\n");
-            close(server_sock);
-            close(client_sock);
-            __sync_fetch_and_sub(&active_connections, 1);
-            return;
-        }
-        sent += w;
-    }
-    fprintf(stderr, "[client] Request enviado ao backend: %d bytes\n", request_len);
-
-    /* Inicia transferência bidirecional */
     pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); 
-    if (!c2s) {
-        close(server_sock);
-        close(client_sock);
-        __sync_fetch_and_sub(&active_connections, 1);
-        return;
-    }
-    c2s[0] = client_sock; 
-    c2s[1] = server_sock;
-    
-    int *s2c = malloc(2 * sizeof(int)); 
-    if (!s2c) {
-        free(c2s);
-        close(server_sock);
-        close(client_sock);
-        __sync_fetch_and_sub(&active_connections, 1);
-        return;
-    }
-    s2c[0] = server_sock; 
-    s2c[1] = client_sock;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
 
-    fprintf(stderr, "[client] Conexão finalizada\n");
-    
     close(client_sock);
     close(server_sock);
-    __sync_fetch_and_sub(&active_connections, 1);
 }
 
 /* ------------------------------------------------------------------ */
-/* accept_loop                                                        */
+/* MELHORIA 4 — accept_loop sem thread wrapper (chamado direto do main) */
+/* MELHORIA 3 — verifica reload_flag antes de cada accept()            */
+/* MELHORIA 2 — aceita clientes IPv4 e IPv6 via sockaddr_storage       */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
     socklen_t               client_len = sizeof(client_addr);
 
     while (1) {
+        /* MELHORIA 3: reload de config via SIGHUP sem reiniciar o processo */
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
@@ -474,11 +370,12 @@ static void accept_loop(int server_sock) {
                                  (struct sockaddr *)&client_addr,
                                  &client_len);
         if (client_sock < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; /* sinal recebido — testa reload_flag */
             perror("accept");
             continue;
         }
 
+        /* Log do IP do cliente — MELHORIA 2: suporta IPv4 e IPv6 */
         char client_ip[INET6_ADDRSTRLEN] = {0};
         if (client_addr.ss_family == AF_INET6) {
             inet_ntop(AF_INET6,
@@ -490,8 +387,6 @@ static void accept_loop(int server_sock) {
                       client_ip, sizeof(client_ip));
         }
 
-        fprintf(stderr, "[accept] Nova conexão de %s\n", client_ip);
-
         pid_t pid = fork();
         if (pid < 0) {
             perror("fork");
@@ -499,10 +394,12 @@ static void accept_loop(int server_sock) {
             continue;
         }
         if (pid == 0) {
+            /* Processo filho */
             close(server_sock);
             handle_client(client_sock);
             exit(0);
         }
+        /* Processo pai */
         close(client_sock);
     }
 }
@@ -513,21 +410,29 @@ static void accept_loop(int server_sock) {
 int main(int argc, char *argv[]) {
     srand(time(NULL));
 
+    /* Ignora SIGPIPE: evita crash em writes para sockets fechados */
     signal(SIGPIPE, SIG_IGN);
 
+    /* Salva args para uso no reload via SIGHUP */
     saved_argc = argc;
     saved_argv = argv;
     parse_args(argc, argv);
 
+    /* MELHORIA 3: instala handler de SIGHUP para reload sem restart.
+     * SA_RESTART desligado → accept() retorna EINTR ao receber SIGHUP,
+     * permitindo que o loop verifique reload_flag imediatamente.         */
     struct sigaction sa_hup = {0};
     sa_hup.sa_handler = handle_sighup;
     sigaction(SIGHUP, &sa_hup, NULL);
 
+    /* Recolhe processos filhos zumbis automaticamente */
     struct sigaction sa_chld = {0};
     sa_chld.sa_handler = handle_sigchld;
     sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
+    /* MELHORIA 2: socket AF_INET6 com IPV6_V6ONLY = 0
+     * → aceita conexões IPv4 (como ::ffff:x.x.x.x) e IPv6 no mesmo fd. */
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
     if (server_sock < 0) { perror("socket"); return 1; }
 
@@ -549,15 +454,12 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("=== ProxyC iniciado ===\n");
-    printf("Porta: %d\n", PORT);
-    printf("Status: %d configurações\n", CONFIG.status_count);
-    printf("Backends: %d configurados\n", CONFIG.backend_count);
-    printf("Buffer: %d bytes\n", BUFFER_SIZE);
-    printf("PID: %d\n", getpid());
+    printf("ProxyC rodando na porta %d (IPv4 + IPv6) | "
+           "Multi-status: %d | Backends: %d\n",
+           PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
-    printf("=======================\n\n");
 
+    /* MELHORIA 4: accept_loop chamado diretamente — sem thread wrapper */
     accept_loop(server_sock);
 
     pthread_rwlock_destroy(&config_lock);
