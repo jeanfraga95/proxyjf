@@ -17,12 +17,14 @@
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      262144  /* Aumentado para 256KB para melhor throughput em vídeos */
-#define PEEK_TIMEOUT     5       /* Aumentado para 5 segundos para lidar com pausas em streaming */
-#define CONNECT_TIMEOUT  10      /* Aumentado para 10 segundos para conexões lentas */
+#define BUFFER_SIZE      262144
+#define PEEK_TIMEOUT     5
+#define CONNECT_TIMEOUT  10
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
-#define MAX_RETRIES      3       /* Número de tentativas para operações de I/O */
+#define MAX_RETRIES      3
+#define MAX_REQUESTS     100     /* Máximo de requisições multiplexadas */
+#define MAX_ROTATE_HOSTS 32      /* Máximo de hosts para rotação */
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
@@ -40,6 +42,24 @@ typedef struct {
     int         backend_count;
 } ProxyConfig;
 
+/* Estrutura para requisição multiplexada */
+typedef struct {
+    char *raw_request;          /* Request original completo */
+    char *method;               /* GET, POST, etc */
+    char *path;                 /* /caminho */
+    char *host;                 /* Host após rotação */
+    char *headers;              /* Headers processados */
+    int   content_length;       /* Content-Length se presente */
+    int   is_websocket;         /* Flag para WebSocket */
+} MultiplexedRequest;
+
+/* Estrutura para rotação de hosts */
+typedef struct {
+    char *hosts[MAX_ROTATE_HOSTS];
+    int   count;
+    int   current_index;
+} RotatingHosts;
+
 /* ------------------------------------------------------------------ */
 /* Globals                                                              */
 /* ------------------------------------------------------------------ */
@@ -47,17 +67,16 @@ static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
 static ProxyConfig       CONFIG         = {0};
 
-/* Reload via SIGHUP */
 static volatile sig_atomic_t  reload_flag  = 0;
 static int                    saved_argc   = 0;
 static char                 **saved_argv   = NULL;
 
-/* Proteção de leitura/escrita da CONFIG durante reload */
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
-
-/* Estatísticas para debug */
 static volatile unsigned long total_bytes_transferred = 0;
 static volatile unsigned long active_connections = 0;
+
+/* Cache de rotação de hosts por conexão */
+static __thread RotatingHosts *thread_host_rotation = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -109,7 +128,6 @@ static void parse_args(int argc, char *argv[]) {
         }
     }
 
-    /* Defaults se nada foi passado */
     if (new_cfg.backend_count == 0) {
         strcpy(new_cfg.backends[0].pattern, "SSH");
         strcpy(new_cfg.backends[0].host,    "0.0.0.0");
@@ -124,7 +142,6 @@ static void parse_args(int argc, char *argv[]) {
         new_cfg.status_count  = 1;
     }
 
-    /* Troca atômica da configuração */
     pthread_rwlock_wrlock(&config_lock);
     free_config(&CONFIG);
     CONFIG         = new_cfg;
@@ -147,7 +164,340 @@ static void handle_sigchld(int sig) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Utilitários de rede                                                  */
+/* Utilitários de string                                               */
+/* ------------------------------------------------------------------ */
+
+/* Substitui [crlf] por \r\n */
+static char *replace_crlf(const char *input) {
+    if (!input) return NULL;
+    
+    const char *search = "[crlf]";
+    const char *replace = "\r\n";
+    char *result;
+    int count = 0;
+    const char *tmp = input;
+    
+    /* Conta ocorrências */
+    while ((tmp = strstr(tmp, search))) {
+        count++;
+        tmp += strlen(search);
+    }
+    
+    if (count == 0) return strdup(input);
+    
+    result = malloc(strlen(input) + (count * (strlen(replace) - strlen(search))) + 1);
+    if (!result) return NULL;
+    
+    char *ptr = result;
+    tmp = input;
+    const char *found;
+    
+    while ((found = strstr(tmp, search))) {
+        memcpy(ptr, tmp, found - tmp);
+        ptr += found - tmp;
+        memcpy(ptr, replace, strlen(replace));
+        ptr += strlen(replace);
+        tmp = found + strlen(search);
+    }
+    strcpy(ptr, tmp);
+    
+    return result;
+}
+
+/* Substitui [lf] por \n */
+static char *replace_lf(const char *input) {
+    if (!input) return NULL;
+    
+    const char *search = "[lf]";
+    const char *replace = "\n";
+    char *result;
+    int count = 0;
+    const char *tmp = input;
+    
+    while ((tmp = strstr(tmp, search))) {
+        count++;
+        tmp += strlen(search);
+    }
+    
+    if (count == 0) return strdup(input);
+    
+    result = malloc(strlen(input) + (count * (strlen(replace) - strlen(search))) + 1);
+    if (!result) return NULL;
+    
+    char *ptr = result;
+    tmp = input;
+    const char *found;
+    
+    while ((found = strstr(tmp, search))) {
+        memcpy(ptr, tmp, found - tmp);
+        ptr += found - tmp;
+        memcpy(ptr, replace, strlen(replace));
+        ptr += strlen(replace);
+        tmp = found + strlen(search);
+    }
+    strcpy(ptr, tmp);
+    
+    return result;
+}
+
+/* Extrai host do cabeçalho Host: */
+static char *extract_host(const char *headers) {
+    const char *host_pattern = "Host:";
+    const char *found = strstr(headers, host_pattern);
+    if (!found) return NULL;
+    
+    found += strlen(host_pattern);
+    while (*found == ' ' || *found == '\t') found++;
+    
+    const char *end = found;
+    while (*end && *end != '\r' && *end != '\n' && *end != ' ') end++;
+    
+    if (end == found) return NULL;
+    
+    char *host = malloc(end - found + 1);
+    if (!host) return NULL;
+    
+    memcpy(host, found, end - found);
+    host[end - found] = '\0';
+    return host;
+}
+
+/* Processa rotação de hosts no formato [rotate=host1;host2;host3] */
+static char *process_host_rotation(const char *input, RotatingHosts *rotator) {
+    if (!input || !rotator) return strdup(input);
+    
+    const char *start = strstr(input, "[rotate=");
+    if (!start) return strdup(input);
+    
+    const char *end = strchr(start + 8, ']');
+    if (!end) return strdup(input);
+    
+    /* Extrai lista de hosts */
+    char *hosts_list = malloc(end - start - 7);
+    if (!hosts_list) return strdup(input);
+    
+    memcpy(hosts_list, start + 8, end - start - 8);
+    hosts_list[end - start - 8] = '\0';
+    
+    /* Parseia hosts */
+    rotator->count = 0;
+    char *token = strtok(hosts_list, ";");
+    while (token && rotator->count < MAX_ROTATE_HOSTS) {
+        rotator->hosts[rotator->count] = strdup(token);
+        rotator->count++;
+        token = strtok(NULL, ";");
+    }
+    free(hosts_list);
+    
+    if (rotator->count == 0) return strdup(input);
+    
+    /* Seleciona próximo host (round-robin) */
+    int idx = __sync_fetch_and_add(&rotator->current_index, 1) % rotator->count;
+    char *selected_host = rotator->hosts[idx];
+    
+    /* Constrói resultado substituindo [rotate=...] pelo host selecionado */
+    size_t prefix_len = start - input;
+    size_t suffix_len = strlen(end + 1);
+    char *result = malloc(prefix_len + strlen(selected_host) + suffix_len + 1);
+    if (!result) return strdup(input);
+    
+    memcpy(result, input, prefix_len);
+    strcpy(result + prefix_len, selected_host);
+    strcpy(result + prefix_len + strlen(selected_host), end + 1);
+    
+    return result;
+}
+
+/* Processa placeholders especiais */
+static char *process_placeholders(const char *input, const char *host, const char *ua) {
+    if (!input) return NULL;
+    
+    char *result = strdup(input);
+    if (!result) return NULL;
+    
+    /* Substitui [host] */
+    if (host) {
+        char *pos;
+        while ((pos = strstr(result, "[host]"))) {
+            char *new_result = malloc(strlen(result) - 6 + strlen(host) + 1);
+            if (!new_result) break;
+            
+            memcpy(new_result, result, pos - result);
+            strcpy(new_result + (pos - result), host);
+            strcpy(new_result + (pos - result) + strlen(host), pos + 6);
+            
+            free(result);
+            result = new_result;
+        }
+    }
+    
+    /* Substitui [ua] (User-Agent aleatório) */
+    if (ua) {
+        char *pos;
+        while ((pos = strstr(result, "[ua]"))) {
+            char *new_result = malloc(strlen(result) - 4 + strlen(ua) + 1);
+            if (!new_result) break;
+            
+            memcpy(new_result, result, pos - result);
+            strcpy(new_result + (pos - result), ua);
+            strcpy(new_result + (pos - result) + strlen(ua), pos + 4);
+            
+            free(result);
+            result = new_result;
+        }
+    }
+    
+    return result;
+}
+
+/* Gera User-Agent aleatório */
+static char *generate_random_ua(void) {
+    const char *uas[] = {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"
+    };
+    return strdup(uas[rand() % (sizeof(uas) / sizeof(uas[0]))]);
+}
+
+/* ------------------------------------------------------------------ */
+/* Processamento de requisições multiplexadas                          */
+/* ------------------------------------------------------------------ */
+
+/* Divide payload em múltiplas requisições usando delimitadores */
+static char **split_requests(const char *payload, int *count) {
+    if (!payload || !count) return NULL;
+    
+    char **requests = malloc(MAX_REQUESTS * sizeof(char *));
+    if (!requests) return NULL;
+    
+    *count = 0;
+    const char *pos = payload;
+    const char *next;
+    
+    while (*pos && *count < MAX_REQUESTS) {
+        /* Procura por delimitadores: [split], [instant_split], \r\n\r\n, \n\n */
+        const char *split = strstr(pos, "[split]");
+        const char *instant = strstr(pos, "[instant_split]");
+        const char *crlfcrlf = strstr(pos, "\r\n\r\n");
+        const char *lfcrlf = strstr(pos, "\n\n");
+        
+        /* Encontra o menor delimitador */
+        const char *delim = NULL;
+        const char *delim_name = NULL;
+        size_t delim_len = 0;
+        
+        if (split) { delim = split; delim_name = "[split]"; delim_len = 7; }
+        if (instant && (!delim || instant < delim)) { 
+            delim = instant; delim_name = "[instant_split]"; delim_len = 15; 
+        }
+        if (crlfcrlf && (!delim || crlfcrlf < delim)) { 
+            delim = crlfcrlf; delim_name = "\r\n\r\n"; delim_len = 4; 
+        }
+        if (lfcrlf && (!delim || lfcrlf < delim)) { 
+            delim = lfcrlf; delim_name = "\n\n"; delim_len = 2; 
+        }
+        
+        if (!delim) {
+            /* Última requisição */
+            requests[*count] = strdup(pos);
+            (*count)++;
+            break;
+        }
+        
+        size_t len = delim - pos;
+        requests[*count] = malloc(len + 1);
+        if (!requests[*count]) break;
+        
+        memcpy(requests[*count], pos, len);
+        requests[*count][len] = '\0';
+        (*count)++;
+        
+        pos = delim + delim_len;
+    }
+    
+    return requests;
+}
+
+/* Processa uma requisição individual */
+static MultiplexedRequest *process_request(const char *raw, RotatingHosts *rotator) {
+    MultiplexedRequest *req = calloc(1, sizeof(MultiplexedRequest));
+    if (!req) return NULL;
+    
+    req->raw_request = strdup(raw);
+    
+    /* Substitui placeholders */
+    char *processed = process_placeholders(raw, "[host]", "[ua]");
+    if (processed) {
+        free(req->raw_request);
+        req->raw_request = processed;
+    }
+    
+    /* Substitui [crlf] e [lf] */
+    char *with_crlf = replace_crlf(req->raw_request);
+    if (with_crlf) {
+        free(req->raw_request);
+        req->raw_request = with_crlf;
+    }
+    
+    char *with_lf = replace_lf(req->raw_request);
+    if (with_lf) {
+        free(req->raw_request);
+        req->raw_request = with_lf;
+    }
+    
+    /* Processa rotação de hosts */
+    char *with_rotation = process_host_rotation(req->raw_request, rotator);
+    if (with_rotation) {
+        free(req->raw_request);
+        req->raw_request = with_rotation;
+    }
+    
+    /* Extrai método e path */
+    char *line_end = strstr(req->raw_request, "\r\n");
+    if (!line_end) line_end = strstr(req->raw_request, "\n");
+    
+    if (line_end) {
+        char *method_end = strchr(req->raw_request, ' ');
+        if (method_end && method_end < line_end) {
+            req->method = malloc(method_end - req->raw_request + 1);
+            memcpy(req->method, req->raw_request, method_end - req->raw_request);
+            req->method[method_end - req->raw_request] = '\0';
+            
+            char *path_start = method_end + 1;
+            char *path_end = strchr(path_start, ' ');
+            if (path_end && path_end < line_end) {
+                req->path = malloc(path_end - path_start + 1);
+                memcpy(req->path, path_start, path_end - path_start);
+                req->path[path_end - path_start] = '\0';
+            }
+        }
+    }
+    
+    /* Extrai Host */
+    req->host = extract_host(req->raw_request);
+    
+    /* Verifica se é WebSocket */
+    if (strstr(req->raw_request, "Upgrade: websocket") ||
+        strstr(req->raw_request, "Upgrade: WebSocket")) {
+        req->is_websocket = 1;
+    }
+    
+    /* Extrai Content-Length */
+    const char *cl = strstr(req->raw_request, "Content-Length:");
+    if (cl) {
+        cl += 15;
+        while (*cl == ' ' || *cl == '\t') cl++;
+        req->content_length = atoi(cl);
+    }
+    
+    return req;
+}
+
+/* ------------------------------------------------------------------ */
+/* Funções de rede                                                     */
 /* ------------------------------------------------------------------ */
 static int peek_data(int sock, char *buffer, int len) {
     struct timeval tv = {PEEK_TIMEOUT, 0};
@@ -158,14 +508,6 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
-/* 
- * CORREÇÃO 1: Função de transferência melhorada com:
- * - Non-blocking I/O para evitar deadlocks
- * - Timeout para operações bloqueantes
- * - Tratamento correto de EAGAIN/EWOULDBLOCK
- * - Estatísticas de transferência
- * - Não faz shutdown prematuro
- */
 static void *transfer(void *arg) {
     int *fds = (int *)arg;
     char *buf = malloc(BUFFER_SIZE);
@@ -174,7 +516,6 @@ static void *transfer(void *arg) {
         return NULL;
     }
 
-    /* Configura sockets para non-blocking */
     int flags_in = fcntl(fds[0], F_GETFL, 0);
     fcntl(fds[0], F_SETFL, flags_in | O_NONBLOCK);
     int flags_out = fcntl(fds[1], F_GETFL, 0);
@@ -199,7 +540,6 @@ static void *transfer(void *arg) {
             if (errno == EINTR) continue;
             break;
         } else if (ready == 0) {
-            /* Timeout - verifica se ainda há dados pendentes */
             retry_count++;
             if (retry_count > MAX_RETRIES) break;
             continue;
@@ -229,7 +569,6 @@ static void *transfer(void *arg) {
                 sent += w;
             }
 
-            /* Log a cada 10MB para debugging */
             if (total % (10 * 1024 * 1024) < (size_t)bytes) {
                 fprintf(stderr, "[transfer] %lu MB transferred\n", total / (1024*1024));
             }
@@ -237,9 +576,7 @@ static void *transfer(void *arg) {
     }
 
 done:
-    /* CORREÇÃO: Não faz shutdown do lado de leitura, apenas do escrita */
     shutdown(fds[1], SHUT_WR);
-    
     __sync_fetch_and_add(&total_bytes_transferred, total);
     
     free(buf);
@@ -278,9 +615,6 @@ static BackendRule *detect_backend(const char *data, int len) {
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* connect() ao backend com timeout + suporte IPv4/IPv6                */
-/* ------------------------------------------------------------------ */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr    = {0};
     socklen_t               saddr_len;
@@ -307,7 +641,6 @@ static int connect_backend(const char *host, int port) {
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("[backend] socket"); return -1; }
 
-    /* CORREÇÃO: Ativa TCP_NODELAY para reduzir latência em streaming */
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
@@ -350,17 +683,19 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* CORREÇÃO 2: Tratamento do cliente completamente reescrito          */
+/* CORREÇÃO: Handler com suporte a multiplexação                       */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
     char        resp[512];
     const char *status = get_random_status();
     int         request_len;
+    RotatingHosts rotator = {0};
+    char *ua = NULL;
     
     __sync_fetch_and_add(&active_connections, 1);
 
-    /* CORREÇÃO: Lê o request completo primeiro */
+    /* Lê request completo */
     request_len = recv(client_sock, buf, BUFFER_SIZE - 1, 0);
     if (request_len <= 0) {
         close(client_sock);
@@ -369,14 +704,16 @@ static void handle_client(int client_sock) {
     }
     buf[request_len] = '\0';
 
-    /* CORREÇÃO: Log do request para debug */
     fprintf(stderr, "[client] Request recebido: %d bytes\n", request_len);
 
-    /* Detecta proxyc no request original */
+    /* Gera User-Agent aleatório para placeholders */
+    ua = generate_random_ua();
+
+    /* Detecta proxyc */
     int has_proxyc = (strstr(buf, "proxyc:on") != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
-    /* CORREÇÃO: Envia respostas com base no request original */
+    /* Envia respostas iniciais */
     if (has_proxyc) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
@@ -384,49 +721,114 @@ static void handle_client(int client_sock) {
     } else {
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        /* Pequena pausa para garantir que o 101 foi enviado */
         usleep(10000);
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    /* CORREÇÃO: Detecta backend baseado no request original, não no peek */
-    BackendRule *backend = detect_backend(buf, request_len);
-    fprintf(stderr, "[client] Backend selecionado: %s:%d (pattern: %s)\n", 
-            backend->host, backend->port, backend->pattern);
+    /* NOVIDADE: Divide payload em múltiplas requisições */
+    int req_count = 0;
+    char **raw_requests = split_requests(buf, &req_count);
+    
+    if (req_count > 1) {
+        fprintf(stderr, "[multiplex] Detectadas %d requisições multiplexadas\n", req_count);
+    }
 
-    /* Conecta ao backend */
-    int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) {
-        fprintf(stderr, "[client] Falha ao conectar ao backend\n");
+    /* Processa cada requisição */
+    MultiplexedRequest *requests[MAX_REQUESTS] = {0};
+    int processed_count = 0;
+
+    for (int i = 0; i < req_count && i < MAX_REQUESTS; i++) {
+        if (!raw_requests[i] || strlen(raw_requests[i]) < 5) continue;
+        
+        /* NOVIDADE: Processa cada requisição individualmente */
+        requests[processed_count] = process_request(raw_requests[i], &rotator);
+        if (requests[processed_count]) {
+            processed_count++;
+        }
+    }
+
+    /* Se não conseguiu processar requisições, usa o payload original */
+    if (processed_count == 0) {
+        requests[0] = process_request(buf, &rotator);
+        processed_count = 1;
+    }
+
+    /* Se ainda não tem requisições, erro */
+    if (processed_count == 0 || !requests[0]) {
+        fprintf(stderr, "[client] Falha ao processar requisição\n");
         close(client_sock);
+        free(ua);
         __sync_fetch_and_sub(&active_connections, 1);
         return;
     }
 
-    /* CORREÇÃO: Envia o request original para o backend */
-    ssize_t sent = 0;
-    while (sent < request_len) {
-        ssize_t w = write(server_sock, buf + sent, request_len - sent);
-        if (w <= 0) {
-            fprintf(stderr, "[client] Falha ao enviar request ao backend\n");
-            close(server_sock);
-            close(client_sock);
-            __sync_fetch_and_sub(&active_connections, 1);
-            return;
-        }
-        sent += w;
+    /* NOVIDADE: Conecta ao backend (usando host da primeira requisição) */
+    const char *backend_host = requests[0]->host ? requests[0]->host : "0.0.0.0";
+    BackendRule *backend = detect_backend(buf, request_len);
+    
+    /* Se o backend for padrão e temos host específico, usa o host */
+    if (strcmp(backend->host, "0.0.0.0") == 0 && requests[0]->host) {
+        strcpy(backend->host, requests[0]->host);
     }
-    fprintf(stderr, "[client] Request enviado ao backend: %d bytes\n", request_len);
+
+    fprintf(stderr, "[client] Backend selecionado: %s:%d\n", backend->host, backend->port);
+
+    int server_sock = connect_backend(backend->host, backend->port);
+    if (server_sock < 0) {
+        fprintf(stderr, "[client] Falha ao conectar ao backend\n");
+        for (int i = 0; i < processed_count; i++) {
+            free(requests[i]->raw_request);
+            free(requests[i]->method);
+            free(requests[i]->path);
+            free(requests[i]->host);
+            free(requests[i]->headers);
+            free(requests[i]);
+        }
+        free(raw_requests);
+        close(client_sock);
+        free(ua);
+        __sync_fetch_and_sub(&active_connections, 1);
+        return;
+    }
+
+    /* NOVIDADE: Envia todas as requisições processadas */
+    for (int i = 0; i < processed_count; i++) {
+        if (requests[i]->raw_request) {
+            int req_len = strlen(requests[i]->raw_request);
+            ssize_t sent = 0;
+            
+            /* Adiciona delimitador entre requisições se necessário */
+            if (i > 0) {
+                write(server_sock, "\r\n", 2);
+            }
+            
+            while (sent < req_len) {
+                ssize_t w = write(server_sock, 
+                                 requests[i]->raw_request + sent, 
+                                 req_len - sent);
+                if (w <= 0) {
+                    fprintf(stderr, "[client] Falha ao enviar request %d ao backend\n", i);
+                    goto cleanup;
+                }
+                sent += w;
+            }
+            
+            fprintf(stderr, "[client] Request %d enviado: %d bytes (host: %s)\n", 
+                    i, req_len, requests[i]->host ? requests[i]->host : "default");
+            
+            /* Se for WebSocket e for a última requisição, mantém conexão aberta */
+            if (requests[i]->is_websocket && i == processed_count - 1) {
+                fprintf(stderr, "[websocket] Conexão WebSocket detectada, mantendo aberta\n");
+            }
+        }
+    }
 
     /* Inicia transferência bidirecional */
     pthread_t t1, t2;
     int *c2s = malloc(2 * sizeof(int)); 
     if (!c2s) {
-        close(server_sock);
-        close(client_sock);
-        __sync_fetch_and_sub(&active_connections, 1);
-        return;
+        goto cleanup;
     }
     c2s[0] = client_sock; 
     c2s[1] = server_sock;
@@ -434,10 +836,7 @@ static void handle_client(int client_sock) {
     int *s2c = malloc(2 * sizeof(int)); 
     if (!s2c) {
         free(c2s);
-        close(server_sock);
-        close(client_sock);
-        __sync_fetch_and_sub(&active_connections, 1);
-        return;
+        goto cleanup;
     }
     s2c[0] = server_sock; 
     s2c[1] = client_sock;
@@ -447,8 +846,27 @@ static void handle_client(int client_sock) {
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
 
-    fprintf(stderr, "[client] Conexão finalizada\n");
+cleanup:
+    /* Limpeza */
+    for (int i = 0; i < processed_count; i++) {
+        if (requests[i]) {
+            free(requests[i]->raw_request);
+            free(requests[i]->method);
+            free(requests[i]->path);
+            free(requests[i]->host);
+            free(requests[i]->headers);
+            free(requests[i]);
+        }
+    }
+    free(raw_requests);
+    free(ua);
     
+    /* Limpa rotação de hosts */
+    for (int i = 0; i < rotator.count; i++) {
+        free(rotator.hosts[i]);
+    }
+
+    fprintf(stderr, "[client] Conexão finalizada\n");
     close(client_sock);
     close(server_sock);
     __sync_fetch_and_sub(&active_connections, 1);
@@ -549,11 +967,13 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("=== ProxyC iniciado ===\n");
+    printf("=== ProxyC Multiplex ===\n");
     printf("Porta: %d\n", PORT);
     printf("Status: %d configurações\n", CONFIG.status_count);
     printf("Backends: %d configurados\n", CONFIG.backend_count);
     printf("Buffer: %d bytes\n", BUFFER_SIZE);
+    printf("Max requests: %d\n", MAX_REQUESTS);
+    printf("Max rotate hosts: %d\n", MAX_ROTATE_HOSTS);
     printf("PID: %d\n", getpid());
     printf("Recarregar config: kill -HUP %d\n", getpid());
     printf("=======================\n\n");
