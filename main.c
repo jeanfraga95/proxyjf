@@ -12,19 +12,15 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <netinet/tcp.h>
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      262144
+#define BUFFER_SIZE      255369  /* aumentado de 4096 para melhor throughput */
 #define PEEK_TIMEOUT     5
-#define CONNECT_TIMEOUT  10
+#define CONNECT_TIMEOUT  10      /* segundos máximos para connect() ao backend */
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
-#define MAX_RETRIES      3
-#define MAX_REQUESTS     100
-#define MAX_ROTATE_HOSTS 32
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
@@ -42,35 +38,20 @@ typedef struct {
     int         backend_count;
 } ProxyConfig;
 
-typedef struct {
-    char *raw_request;
-    char *method;
-    char *path;
-    char *host;
-    int   content_length;
-    int   is_websocket;
-} MultiplexedRequest;
-
-typedef struct {
-    char *hosts[MAX_ROTATE_HOSTS];
-    int   count;
-    int   current_index;
-} RotatingHosts;
-
 /* ------------------------------------------------------------------ */
-/* Globais                                                              */
+/* Globals                                                              */
 /* ------------------------------------------------------------------ */
 static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
 static ProxyConfig       CONFIG         = {0};
 
+/* Reload via SIGHUP */
 static volatile sig_atomic_t  reload_flag  = 0;
 static int                    saved_argc   = 0;
 static char                 **saved_argv   = NULL;
 
+/* Proteção de leitura/escrita da CONFIG durante reload */
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
-static volatile unsigned long total_bytes_transferred = 0;
-static volatile unsigned long active_connections = 0;
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -122,6 +103,7 @@ static void parse_args(int argc, char *argv[]) {
         }
     }
 
+    /* Defaults se nada foi passado */
     if (new_cfg.backend_count == 0) {
         strcpy(new_cfg.backends[0].pattern, "SSH");
         strcpy(new_cfg.backends[0].host,    "0.0.0.0");
@@ -136,6 +118,7 @@ static void parse_args(int argc, char *argv[]) {
         new_cfg.status_count  = 1;
     }
 
+    /* Troca atômica da configuração */
     pthread_rwlock_wrlock(&config_lock);
     free_config(&CONFIG);
     CONFIG         = new_cfg;
@@ -147,387 +130,26 @@ static void parse_args(int argc, char *argv[]) {
 /* ------------------------------------------------------------------ */
 /* Handlers de sinal                                                    */
 /* ------------------------------------------------------------------ */
+
+/*
+ * SIGHUP: sinaliza reload. accept() retornará EINTR (SA_RESTART desligado)
+ * e o loop principal verificará reload_flag antes do próximo accept.
+ */
 static void handle_sighup(int sig) {
     (void)sig;
     reload_flag = 1;
 }
 
+/*
+ * SIGCHLD: recolhe processos filhos zumbis sem bloquear.
+ */
 static void handle_sigchld(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
 /* ------------------------------------------------------------------ */
-/* Utilitários de string                                               */
-/* ------------------------------------------------------------------ */
-static char *replace_crlf(const char *input) {
-    if (!input) return NULL;
-    
-    const char *search = "[crlf]";
-    const char *replace = "\r\n";
-    char *result;
-    int count = 0;
-    const char *tmp = input;
-    
-    while ((tmp = strstr(tmp, search))) {
-        count++;
-        tmp += strlen(search);
-    }
-    
-    if (count == 0) return strdup(input);
-    
-    result = malloc(strlen(input) + (count * (strlen(replace) - strlen(search))) + 1);
-    if (!result) return NULL;
-    
-    char *ptr = result;
-    tmp = input;
-    const char *found;
-    
-    while ((found = strstr(tmp, search))) {
-        memcpy(ptr, tmp, found - tmp);
-        ptr += found - tmp;
-        memcpy(ptr, replace, strlen(replace));
-        ptr += strlen(replace);
-        tmp = found + strlen(search);
-    }
-    strcpy(ptr, tmp);
-    
-    return result;
-}
-
-static char *replace_lf(const char *input) {
-    if (!input) return NULL;
-    
-    const char *search = "[lf]";
-    const char *replace = "\n";
-    char *result;
-    int count = 0;
-    const char *tmp = input;
-    
-    while ((tmp = strstr(tmp, search))) {
-        count++;
-        tmp += strlen(search);
-    }
-    
-    if (count == 0) return strdup(input);
-    
-    result = malloc(strlen(input) + (count * (strlen(replace) - strlen(search))) + 1);
-    if (!result) return NULL;
-    
-    char *ptr = result;
-    tmp = input;
-    const char *found;
-    
-    while ((found = strstr(tmp, search))) {
-        memcpy(ptr, tmp, found - tmp);
-        ptr += found - tmp;
-        memcpy(ptr, replace, strlen(replace));
-        ptr += strlen(replace);
-        tmp = found + strlen(search);
-    }
-    strcpy(ptr, tmp);
-    
-    return result;
-}
-
-static char *extract_host(const char *headers) {
-    const char *host_pattern = "Host:";
-    const char *found = strstr(headers, host_pattern);
-    if (!found) return NULL;
-    
-    found += strlen(host_pattern);
-    while (*found == ' ' || *found == '\t') found++;
-    
-    const char *end = found;
-    while (*end && *end != '\r' && *end != '\n' && *end != ' ') end++;
-    
-    if (end == found) return NULL;
-    
-    char *host = malloc(end - found + 1);
-    if (!host) return NULL;
-    
-    memcpy(host, found, end - found);
-    host[end - found] = '\0';
-    return host;
-}
-
-static void init_rotating_hosts(RotatingHosts *rotator, const char *hosts_list) {
-    if (!rotator || !hosts_list) return;
-    
-    // Libera hosts anteriores
-    for (int i = 0; i < rotator->count; i++) {
-        free(rotator->hosts[i]);
-        rotator->hosts[i] = NULL;
-    }
-    rotator->count = 0;
-    rotator->current_index = 0;
-    
-    char *copy = strdup(hosts_list);
-    if (!copy) return;
-    
-    char *token = strtok(copy, ";");
-    while (token && rotator->count < MAX_ROTATE_HOSTS) {
-        rotator->hosts[rotator->count] = strdup(token);
-        rotator->count++;
-        token = strtok(NULL, ";");
-    }
-    
-    free(copy);
-}
-
-static char *get_rotated_host(RotatingHosts *rotator) {
-    if (!rotator || rotator->count == 0) return NULL;
-    
-    int idx = __sync_fetch_and_add(&rotator->current_index, 1) % rotator->count;
-    return rotator->hosts[idx];
-}
-
-static char *process_host_rotation(const char *input, RotatingHosts *rotator) {
-    if (!input || !rotator) return strdup(input ? input : "");
-    
-    const char *start = strstr(input, "[rotate=");
-    if (!start) return strdup(input);
-    
-    const char *end = strchr(start + 8, ']');
-    if (!end) return strdup(input);
-    
-    // Extrai a lista de hosts
-    size_t list_len = end - start - 8;
-    char *hosts_list = malloc(list_len + 1);
-    if (!hosts_list) return strdup(input);
-    
-    memcpy(hosts_list, start + 8, list_len);
-    hosts_list[list_len] = '\0';
-    
-    // Inicializa o rotator com a lista
-    init_rotating_hosts(rotator, hosts_list);
-    free(hosts_list);
-    
-    if (rotator->count == 0) return strdup(input);
-    
-    // Pega o primeiro host da rotação
-    char *selected_host = get_rotated_host(rotator);
-    if (!selected_host) return strdup(input);
-    
-    // Reconstrói a string com o host selecionado
-    size_t prefix_len = start - input;
-    size_t suffix_len = strlen(end + 1);
-    char *result = malloc(prefix_len + strlen(selected_host) + suffix_len + 1);
-    if (!result) return strdup(input);
-    
-    memcpy(result, input, prefix_len);
-    strcpy(result + prefix_len, selected_host);
-    strcpy(result + prefix_len + strlen(selected_host), end + 1);
-    
-    return result;
-}
-
-static char *process_placeholders(const char *input, const char *host, const char *ua) {
-    if (!input) return NULL;
-    
-    char *result = strdup(input);
-    if (!result) return NULL;
-    
-    // Substitui [host]
-    if (host) {
-        char *pos;
-        while ((pos = strstr(result, "[host]"))) {
-            size_t prefix_len = pos - result;
-            size_t suffix_len = strlen(pos + 6);
-            char *new_result = malloc(prefix_len + strlen(host) + suffix_len + 1);
-            if (!new_result) break;
-            
-            memcpy(new_result, result, prefix_len);
-            strcpy(new_result + prefix_len, host);
-            strcpy(new_result + prefix_len + strlen(host), pos + 6);
-            
-            free(result);
-            result = new_result;
-        }
-    }
-    
-    // Substitui [ua]
-    if (ua) {
-        char *pos;
-        while ((pos = strstr(result, "[ua]"))) {
-            size_t prefix_len = pos - result;
-            size_t suffix_len = strlen(pos + 4);
-            char *new_result = malloc(prefix_len + strlen(ua) + suffix_len + 1);
-            if (!new_result) break;
-            
-            memcpy(new_result, result, prefix_len);
-            strcpy(new_result + prefix_len, ua);
-            strcpy(new_result + prefix_len + strlen(ua), pos + 4);
-            
-            free(result);
-            result = new_result;
-        }
-    }
-    
-    return result;
-}
-
-static char *generate_random_ua(void) {
-    const char *uas[] = {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"
-    };
-    return strdup(uas[rand() % (sizeof(uas) / sizeof(uas[0]))]);
-}
-
-/* ------------------------------------------------------------------ */
-/* Processamento de requisições multiplexadas                          */
-/* ------------------------------------------------------------------ */
-static char **split_requests(const char *payload, int *count) {
-    if (!payload || !count) return NULL;
-    
-    char **requests = calloc(MAX_REQUESTS, sizeof(char *));
-    if (!requests) return NULL;
-    
-    *count = 0;
-    const char *pos = payload;
-    
-    while (*pos && *count < MAX_REQUESTS) {
-        const char *split = strstr(pos, "[split]");
-        const char *instant = strstr(pos, "[instant_split]");
-        const char *crlfcrlf = strstr(pos, "\r\n\r\n");
-        const char *lfcrlf = strstr(pos, "\n\n");
-        
-        const char *delim = NULL;
-        size_t delim_len = 0;
-        
-        if (split) { delim = split; delim_len = 7; }
-        if (instant && (!delim || instant < delim)) { 
-            delim = instant; delim_len = 15; 
-        }
-        if (crlfcrlf && (!delim || crlfcrlf < delim)) { 
-            delim = crlfcrlf; delim_len = 4; 
-        }
-        if (lfcrlf && (!delim || lfcrlf < delim)) { 
-            delim = lfcrlf; delim_len = 2; 
-        }
-        
-        if (!delim) {
-            requests[*count] = strdup(pos);
-            (*count)++;
-            break;
-        }
-        
-        size_t len = delim - pos;
-        if (len > 0) {
-            requests[*count] = malloc(len + 1);
-            if (requests[*count]) {
-                memcpy(requests[*count], pos, len);
-                requests[*count][len] = '\0';
-                (*count)++;
-            }
-        }
-        
-        pos = delim + delim_len;
-    }
-    
-    return requests;
-}
-
-static MultiplexedRequest *process_request(const char *raw, RotatingHosts *rotator, 
-                                          const char *actual_host, const char *ua) {
-    if (!raw) return NULL;
-    
-    MultiplexedRequest *req = calloc(1, sizeof(MultiplexedRequest));
-    if (!req) return NULL;
-    
-    // CORREÇÃO 1: Primeiro faz as substituições básicas
-    char *processed = process_placeholders(raw, actual_host, ua);
-    if (!processed) {
-        processed = strdup(raw);
-    }
-    
-    // CORREÇÃO 2: Depois substitui [crlf] e [lf]
-    char *with_crlf = replace_crlf(processed);
-    if (with_crlf) {
-        free(processed);
-        processed = with_crlf;
-    }
-    
-    char *with_lf = replace_lf(processed);
-    if (with_lf) {
-        free(processed);
-        processed = with_lf;
-    }
-    
-    // CORREÇÃO 3: Por último, processa rotação de hosts
-    char *with_rotation = process_host_rotation(processed, rotator);
-    if (with_rotation) {
-        free(processed);
-        processed = with_rotation;
-    }
-    
-    req->raw_request = processed;
-    
-    // Extrai método
-    char *method_end = strchr(req->raw_request, ' ');
-    if (method_end) {
-        req->method = malloc(method_end - req->raw_request + 1);
-        if (req->method) {
-            memcpy(req->method, req->raw_request, method_end - req->raw_request);
-            req->method[method_end - req->raw_request] = '\0';
-        }
-        
-        // Extrai path
-        char *path_start = method_end + 1;
-        char *path_end = strchr(path_start, ' ');
-        if (path_end) {
-            req->path = malloc(path_end - path_start + 1);
-            if (req->path) {
-                memcpy(req->path, path_start, path_end - path_start);
-                req->path[path_end - path_start] = '\0';
-            }
-        }
-    }
-    
-    // Extrai host do request processado
-    req->host = extract_host(req->raw_request);
-    
-    // Detecta websocket
-    if (strstr(req->raw_request, "Upgrade: websocket") ||
-        strstr(req->raw_request, "Upgrade: WebSocket")) {
-        req->is_websocket = 1;
-    }
-    
-    // Extrai Content-Length
-    const char *cl = strstr(req->raw_request, "Content-Length:");
-    if (cl) {
-        cl += 15;
-        while (*cl == ' ' || *cl == '\t') cl++;
-        req->content_length = atoi(cl);
-    }
-    
-    return req;
-}
-
-static void free_multiplexed_request(MultiplexedRequest *req) {
-    if (!req) return;
-    free(req->raw_request);
-    free(req->method);
-    free(req->path);
-    free(req->host);
-    free(req);
-}
-
-static void free_rotating_hosts(RotatingHosts *rotator) {
-    if (!rotator) return;
-    for (int i = 0; i < rotator->count; i++) {
-        free(rotator->hosts[i]);
-        rotator->hosts[i] = NULL;
-    }
-    rotator->count = 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Funções de rede                                                     */
+/* Utilitários de rede                                                  */
 /* ------------------------------------------------------------------ */
 static int peek_data(int sock, char *buffer, int len) {
     struct timeval tv = {PEEK_TIMEOUT, 0};
@@ -538,46 +160,26 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
+/*
+ * Transfere dados de fds[0] → fds[1] em loop (trata writes parciais).
+ * Não fecha os fds — isso fica a cargo do processo pai após o join.
+ */
 static void *transfer(void *arg) {
-    int *fds = (int *)arg;
-    char *buf = malloc(BUFFER_SIZE);
-    if (!buf) {
-        free(fds);
-        return NULL;
-    }
+    int    *fds = (int *)arg;
+    char    buf[BUFFER_SIZE];
+    ssize_t bytes;
 
-    ssize_t bytes, sent;
-    unsigned long total = 0;
-
-    // CORREÇÃO 4: Transfer mais simples e robusta (mantendo compatibilidade)
     while ((bytes = read(fds[0], buf, BUFFER_SIZE)) > 0) {
-        total += bytes;
-        sent = 0;
-        
+        ssize_t sent = 0;
         while (sent < bytes) {
             ssize_t w = write(fds[1], buf + sent, bytes - sent);
-            if (w <= 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    usleep(1000);
-                    continue;
-                }
-                goto done;
-            }
+            if (w <= 0) goto done;
             sent += w;
         }
-        
-        // Log a cada 10MB transferidos
-        if (total % (10 * 1024 * 1024) < (unsigned long)bytes) {
-            fprintf(stderr, "[transfer] %lu MB transferred\n", total / (1024*1024));
-        }
     }
-
 done:
     shutdown(fds[1], SHUT_WR);
     shutdown(fds[0], SHUT_RD);
-    __sync_fetch_and_add(&total_bytes_transferred, total);
-    
-    free(buf);
     free(fds);
     return NULL;
 }
@@ -613,6 +215,14 @@ static BackendRule *detect_backend(const char *data, int len) {
     return r;
 }
 
+/* ------------------------------------------------------------------ */
+/* MELHORIA 1 — connect() ao backend com timeout + suporte IPv4/IPv6   */
+/* ------------------------------------------------------------------ */
+/*
+ * Cria um socket para o backend detectando automaticamente se o host
+ * é um endereço IPv4 ou IPv6. Usa O_NONBLOCK + select() para garantir
+ * que a tentativa de conexão não bloqueie mais que CONNECT_TIMEOUT s.
+ */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr    = {0};
     socklen_t               saddr_len;
@@ -621,6 +231,7 @@ static int connect_backend(const char *host, int port) {
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
+    /* Tenta interpretar o host como IPv6 primeiro, depois IPv4 */
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
         family          = AF_INET6;
         s6->sin6_family = AF_INET6;
@@ -639,10 +250,7 @@ static int connect_backend(const char *host, int port) {
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("[backend] socket"); return -1; }
 
-    // Otimização de performance
-    int flag = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
+    /* Coloca em modo não-bloqueante para aplicar o timeout */
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -654,6 +262,7 @@ static int connect_backend(const char *host, int port) {
     }
 
     if (r != 0) {
+        /* Aguarda o socket ficar gravável ou o timeout expirar */
         fd_set         wfds;
         struct timeval tv = {CONNECT_TIMEOUT, 0};
         FD_ZERO(&wfds);
@@ -666,6 +275,7 @@ static int connect_backend(const char *host, int port) {
             return -1;
         }
 
+        /* Verifica se o connect realmente teve êxito */
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
@@ -677,207 +287,77 @@ static int connect_backend(const char *host, int port) {
         }
     }
 
+    /* Restaura modo bloqueante para o uso normal de I/O */
     fcntl(sock, F_SETFL, flags);
     return sock;
 }
 
 /* ------------------------------------------------------------------ */
-/* CORREÇÃO PRINCIPAL: Handler mantendo ordem original + novas features */
+/* Tratamento do cliente                                                */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
-    char        resp[512];
+    char        resp[256];
     const char *status = get_random_status();
-    RotatingHosts rotator = {0};
-    char *ua = NULL;
-    
-    __sync_fetch_and_add(&active_connections, 1);
 
-    // CORREÇÃO 5: Mantém a ordem original - primeiro faz o handshake HTTP
-    
-    // 1. Peek do request para detectar o header especial
+    /* Peek do request para detectar o header especial */
     peek_data(client_sock, buf, sizeof(buf) - 1);
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
     if (has_proxyc) {
-        // Modo proxyc:on → duplo 200
+        /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        // Consome o request da fila
-        int req_len = recv(client_sock, buf, BUFFER_SIZE, 0);
-        if (req_len <= 0) {
-            close(client_sock);
-            __sync_fetch_and_sub(&active_connections, 1);
-            return;
+        /* Consome o request da fila */
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
         }
-        buf[req_len] = '\0';
-        fprintf(stderr, "[client] Request recebido: %d bytes\n", req_len);
     } else {
-        // Modo padrão → 101 → consome request → 200
+        /* Modo padrão → 101 → consome request → 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        
-        int req_len = recv(client_sock, buf, BUFFER_SIZE, 0);
-        if (req_len <= 0) {
-            close(client_sock);
-            __sync_fetch_and_sub(&active_connections, 1);
-            return;
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
         }
-        buf[req_len] = '\0';
-        fprintf(stderr, "[client] Request recebido: %d bytes\n", req_len);
-        
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    // CORREÇÃO 6: Agora que o handshake HTTP está completo, processa as requisições
-    
-    // Gera User-Agent para substituição
-    ua = generate_random_ua();
-    
-    // Detecta backend baseado no payload
-    BackendRule *backend = detect_backend(buf, strlen(buf));
-    fprintf(stderr, "[client] Backend detectado: %s:%d\n", backend->host, backend->port);
-    
-    // CORREÇÃO 7: Processa requisições multiplexadas APÓS handshake
-    int req_count = 0;
-    char **raw_requests = split_requests(buf, &req_count);
-    
-    MultiplexedRequest *requests[MAX_REQUESTS] = {0};
-    int processed_count = 0;
+    /* Peek do próximo payload para escolher o backend */
+    char peek[BUFFER_SIZE] = {0};
+    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
+    BackendRule *backend = detect_backend(peek, peeked);
 
-    if (req_count > 0 && raw_requests) {
-        for (int i = 0; i < req_count && i < MAX_REQUESTS; i++) {
-            if (!raw_requests[i] || strlen(raw_requests[i]) < 5) continue;
-            
-            // CORREÇÃO 8: Passa valores reais para process_placeholders
-            const char *host_for_request = backend->host;
-            if (strcmp(host_for_request, "0.0.0.0") == 0) {
-                // Tenta extrair host do próprio request
-                char *extracted = extract_host(raw_requests[i]);
-                if (extracted) {
-                    host_for_request = extracted;
-                }
-            }
-            
-            requests[processed_count] = process_request(raw_requests[i], &rotator, 
-                                                       host_for_request, ua);
-            if (requests[processed_count]) {
-                processed_count++;
-            }
-            
-            if (host_for_request != backend->host) {
-                free((char *)host_for_request);
-            }
-        }
-    }
-    
-    // Fallback: se nenhum request foi processado, usa o buffer original
-    if (processed_count == 0) {
-        const char *host_for_fallback = backend->host;
-        if (strcmp(host_for_fallback, "0.0.0.0") == 0) {
-            char *extracted = extract_host(buf);
-            if (extracted) {
-                host_for_fallback = extracted;
-            }
-        }
-        
-        requests[0] = process_request(buf, &rotator, host_for_fallback, ua);
-        processed_count = 1;
-        
-        if (host_for_fallback != backend->host) {
-            free((char *)host_for_fallback);
-        }
-    }
-
-    // CORREÇÃO 9: Conecta ao backend
+    /* MELHORIA 1: connect com timeout e suporte IPv4/IPv6 */
     int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) {
-        fprintf(stderr, "[client] Falha ao conectar ao backend\n");
-        goto cleanup;
-    }
+    if (server_sock < 0) { close(client_sock); return; }
 
-    // CORREÇÃO 10: Envia TODAS as requisições processadas para o backend
-    fprintf(stderr, "[client] Enviando %d requisições para o backend\n", processed_count);
-    for (int i = 0; i < processed_count; i++) {
-        if (requests[i] && requests[i]->raw_request) {
-            int req_len = strlen(requests[i]->raw_request);
-            ssize_t sent = 0;
-            
-            // Adiciona separador entre requisições
-            if (i > 0) {
-                write(server_sock, "\r\n", 2);
-            }
-            
-            while (sent < req_len) {
-                ssize_t w = write(server_sock, 
-                                 requests[i]->raw_request + sent, 
-                                 req_len - sent);
-                if (w <= 0) {
-                    fprintf(stderr, "[client] Falha ao enviar request %d\n", i);
-                    goto cleanup;
-                }
-                sent += w;
-            }
-            
-            fprintf(stderr, "[client] Request %d enviado: %d bytes\n", i, req_len);
-        }
-    }
-
-    // CORREÇÃO 11: Inicia transferência bidirecional
-    fprintf(stderr, "[client] Iniciando transferência de dados\n");
-    
     pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); 
-    if (!c2s) goto cleanup;
-    c2s[0] = client_sock; 
-    c2s[1] = server_sock;
-    
-    int *s2c = malloc(2 * sizeof(int)); 
-    if (!s2c) {
-        free(c2s);
-        goto cleanup;
-    }
-    s2c[0] = server_sock; 
-    s2c[1] = client_sock;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
 
-cleanup:
-    // CORREÇÃO 12: Limpeza adequada de todos os recursos
-    for (int i = 0; i < processed_count; i++) {
-        free_multiplexed_request(requests[i]);
-    }
-    
-    if (raw_requests) {
-        for (int i = 0; i < req_count; i++) {
-            free(raw_requests[i]);
-        }
-        free(raw_requests);
-    }
-    
-    free(ua);
-    free_rotating_hosts(&rotator);
-
-    fprintf(stderr, "[client] Conexão finalizada\n");
-    if (server_sock >= 0) close(server_sock);
     close(client_sock);
-    __sync_fetch_and_sub(&active_connections, 1);
+    close(server_sock);
 }
 
 /* ------------------------------------------------------------------ */
-/* accept_loop                                                        */
+/* MELHORIA 4 — accept_loop sem thread wrapper (chamado direto do main) */
+/* MELHORIA 3 — verifica reload_flag antes de cada accept()            */
+/* MELHORIA 2 — aceita clientes IPv4 e IPv6 via sockaddr_storage       */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
     socklen_t               client_len = sizeof(client_addr);
 
     while (1) {
+        /* MELHORIA 3: reload de config via SIGHUP sem reiniciar o processo */
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
@@ -890,11 +370,12 @@ static void accept_loop(int server_sock) {
                                  (struct sockaddr *)&client_addr,
                                  &client_len);
         if (client_sock < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; /* sinal recebido — testa reload_flag */
             perror("accept");
             continue;
         }
 
+        /* Log do IP do cliente — MELHORIA 2: suporta IPv4 e IPv6 */
         char client_ip[INET6_ADDRSTRLEN] = {0};
         if (client_addr.ss_family == AF_INET6) {
             inet_ntop(AF_INET6,
@@ -906,8 +387,6 @@ static void accept_loop(int server_sock) {
                       client_ip, sizeof(client_ip));
         }
 
-        fprintf(stderr, "[accept] Nova conexão de %s\n", client_ip);
-
         pid_t pid = fork();
         if (pid < 0) {
             perror("fork");
@@ -915,10 +394,12 @@ static void accept_loop(int server_sock) {
             continue;
         }
         if (pid == 0) {
+            /* Processo filho */
             close(server_sock);
             handle_client(client_sock);
             exit(0);
         }
+        /* Processo pai */
         close(client_sock);
     }
 }
@@ -929,21 +410,29 @@ static void accept_loop(int server_sock) {
 int main(int argc, char *argv[]) {
     srand(time(NULL));
 
+    /* Ignora SIGPIPE: evita crash em writes para sockets fechados */
     signal(SIGPIPE, SIG_IGN);
 
+    /* Salva args para uso no reload via SIGHUP */
     saved_argc = argc;
     saved_argv = argv;
     parse_args(argc, argv);
 
+    /* MELHORIA 3: instala handler de SIGHUP para reload sem restart.
+     * SA_RESTART desligado → accept() retorna EINTR ao receber SIGHUP,
+     * permitindo que o loop verifique reload_flag imediatamente.         */
     struct sigaction sa_hup = {0};
     sa_hup.sa_handler = handle_sighup;
     sigaction(SIGHUP, &sa_hup, NULL);
 
+    /* Recolhe processos filhos zumbis automaticamente */
     struct sigaction sa_chld = {0};
     sa_chld.sa_handler = handle_sigchld;
     sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
+    /* MELHORIA 2: socket AF_INET6 com IPV6_V6ONLY = 0
+     * → aceita conexões IPv4 (como ::ffff:x.x.x.x) e IPv6 no mesmo fd. */
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
     if (server_sock < 0) { perror("socket"); return 1; }
 
@@ -965,17 +454,12 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("=== ProxyC Multiplex ===\n");
-    printf("Porta: %d\n", PORT);
-    printf("Status: %d configurações\n", CONFIG.status_count);
-    printf("Backends: %d configurados\n", CONFIG.backend_count);
-    printf("Buffer: %d bytes\n", BUFFER_SIZE);
-    printf("Max requests: %d\n", MAX_REQUESTS);
-    printf("Max rotate hosts: %d\n", MAX_ROTATE_HOSTS);
-    printf("PID: %d\n", getpid());
+    printf("ProxyC rodando na porta %d (IPv4 + IPv6) | "
+           "Multi-status: %d | Backends: %d\n",
+           PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
-    printf("=======================\n\n");
 
+    /* MELHORIA 4: accept_loop chamado diretamente — sem thread wrapper */
     accept_loop(server_sock);
 
     pthread_rwlock_destroy(&config_lock);
