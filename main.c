@@ -311,7 +311,6 @@ static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256];
 
-    /* 1. Peek inicial */
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
 
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
@@ -320,8 +319,7 @@ static void handle_client(int client_sock) {
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi   = (verb_count > 1);
 
-    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d | peeked=%d\n", 
-            verb_count, is_multi, has_proxyc, peeked);
+    fprintf(stderr, "[client] verbos=%d multi=%d | peeked=%d\n", verb_count, is_multi, peeked);
 
     const char *status = get_random_status();
 
@@ -340,40 +338,27 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo inteligente */
-        fprintf(stderr, "[multi] Iniciando consumo inteligente...\n");
-        
-        int total_consumed = 0;
-        char drain_buf[16384];
-        int loops = 0;
-
-        while (loops < 40) {
-            loops++;
-            ssize_t n = recv(client_sock, drain_buf, sizeof(drain_buf), 0);
+        /* Consumo do handshake */
+        fprintf(stderr, "[multi] Consumindo handshake...\n");
+        int total = 0;
+        char drain[16384];
+        while (total < 800) {
+            ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
             if (n <= 0) break;
-
-            total_consumed += n;
-            fprintf(stderr, "[multi] Consumido +%ld bytes (total: %d)\n", n, total_consumed);
-
-            if (count_http_verbs(drain_buf, n) > 0) {
-                fprintf(stderr, "[multi] Ainda tem verbo HTTP - continuando...\n");
-                continue;
-            }
-
-            if (loops >= 3) {
-                fprintf(stderr, "[multi] Handshake finalizado\n");
-                break;
-            }
+            total += n;
+            fprintf(stderr, "[multi] +%ld bytes (total %d)\n", n, total);
+            if (count_http_verbs(drain, n) == 0) break;
         }
+        fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
-        fprintf(stderr, "[multi] Consumo finalizado: %d bytes\n", total_consumed);
-
-        /* 200 OK final */
+        /* 200 OK */
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
+        fprintf(stderr, "[multi] 200 OK enviado - iniciando túnel imediatamente\n");
     }
     else {
+        /* Modo normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         consume_headers(client_sock);
@@ -381,38 +366,19 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* === AGUARDA PAYLOAD REAL (IMPORTANTE) === */
-    fprintf(stderr, "[multi] Aguardando payload real após 200 OK...\n");
-    usleep(150000);  // 150ms
+    /* === TUNELAMENTO IMEDIATO (sem peek longo) === */
+    usleep(30000); // apenas 30ms
 
-    /* Peek com várias tentativas */
     char peek_payload[BUFFER_SIZE] = {0};
-    int peeked_payload = 0;
-    int attempts = 0;
+    int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
 
-    while (attempts < 8 && peeked_payload == 0) {
-        attempts++;
-        peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
-        if (peeked_payload == 0) {
-            usleep(50000);  // 50ms entre tentativas
-        }
-    }
-
-    fprintf(stderr, "[backend detect] peeked_payload = %d bytes (após %d tentativas)\n", 
-            peeked_payload, attempts);
-
-    if (peeked_payload > 0) {
-        fprintf(stderr, "[payload preview] %d bytes - OK\n", peeked_payload);
-    } else {
-        fprintf(stderr, "[payload preview] Nenhum dado visível ainda - usando fallback\n");
-    }
+    fprintf(stderr, "[tunnel] peeked_payload = %d bytes\n", peeked_payload);
 
     BackendRule *backend = detect_backend(peek_payload, peeked_payload);
-    fprintf(stderr, "[backend] Usando %s:%d\n", backend->host, backend->port);
+    fprintf(stderr, "[tunnel] Conectando backend %s:%d\n", backend->host, backend->port);
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
-        fprintf(stderr, "[ERRO] Falha ao conectar backend\n");
         close(client_sock);
         return;
     }
