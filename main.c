@@ -300,6 +300,7 @@ static void handle_client(int client_sock) {
     const char *status = get_random_status();
 
     if (is_multi) {
+        /* ====================== MODO MULTI-STATUS (mantido bom) ====================== */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -349,6 +350,50 @@ static void handle_client(int client_sock) {
         close(server_sock);
         return;
     }
+
+    /* ====================== MODO NORMAL (melhorado) ====================== */
+    fprintf(stderr, "[normal] Modo simples detectado\n");
+
+    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+    write(client_sock, resp, strlen(resp));
+
+    /* Consome headers de forma confiável */
+    consume_headers(client_sock);
+
+    snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+    write(client_sock, resp, strlen(resp));
+
+    fprintf(stderr, "[normal] 200 OK enviado - Tunelando...\n");
+
+    /* Pequeno delay + peek para detectar backend */
+    usleep(40000); // 40ms
+
+    char p[BUFFER_SIZE] = {0};
+    int p_len = peek_data(client_sock, p, sizeof(p)-1);
+
+    BackendRule *b = detect_backend(p, p_len);
+    fprintf(stderr, "[normal] Backend escolhido: %s:%d\n", b->host, b->port);
+
+    int server_sock = connect_backend(b->host, b->port);
+    if (server_sock < 0) {
+        fprintf(stderr, "[ERRO] Falha ao conectar backend normal\n");
+        close(client_sock);
+        return;
+    }
+
+    pthread_t t1, t2;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
+
+    pthread_create(&t1, NULL, transfer, c2s);
+    pthread_create(&t2, NULL, transfer, s2c);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    close(client_sock);
+    close(server_sock);
+}
 
     /* Modo Normal */
     snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
