@@ -311,7 +311,7 @@ static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256];
 
-    /* Peek inicial sem consumir */
+    /* 1. Peek inicial */
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
 
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
@@ -320,7 +320,8 @@ static void handle_client(int client_sock) {
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi   = (verb_count > 1);
 
-    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d\n", verb_count, is_multi, has_proxyc);
+    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d | peeked=%d\n", 
+            verb_count, is_multi, has_proxyc, peeked);
 
     const char *status = get_random_status();
 
@@ -328,18 +329,23 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        recv(client_sock, buf, BUFFER_SIZE, 0); /* consome */
+        recv(client_sock, buf, BUFFER_SIZE, 0);
     }
     else if (is_multi) {
-        /* Modo Multi-Status Corrigido */
+        fprintf(stderr, "[multi] Respondendo %d vezes 101\n", verb_count);
+
+        /* Responde 101 para cada verbo */
         for (int i = 0; i < verb_count; i++) {
             status = get_random_status();
             snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-            write(client_sock, resp, strlen(resp));
+            if (write(client_sock, resp, strlen(resp)) <= 0) {
+                close(client_sock); return;
+            }
         }
 
-        /* Consome APENAS os headers */
-        consume_headers(client_sock);
+        /* === CONSUME HEADERS COM MAIS CUIDADO === */
+        int consumed = consume_headers(client_sock);
+        fprintf(stderr, "[multi] Headers consumidos: %d bytes\n", consumed);
 
         /* 200 final */
         status = get_random_status();
@@ -357,14 +363,25 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Peek do payload real para detectar backend */
+    /* Pequeno delay para dar tempo do app enviar o payload real */
+    usleep(50000);  // 50ms
+
+    /* 2. Peek do payload REAL para detectar backend */
     char peek_payload[BUFFER_SIZE] = {0};
     int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
 
+    fprintf(stderr, "[backend detect] peeked_payload = %d bytes\n", peeked_payload);
+    if (peeked_payload > 0) {
+        fprintf(stderr, "[payload preview] %.100s...\n", peek_payload);
+    }
+
     BackendRule *backend = detect_backend(peek_payload, peeked_payload);
+
+    fprintf(stderr, "[backend] Usando %s:%d\n", backend->host, backend->port);
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
+        fprintf(stderr, "[ERRO] Falha ao conectar no backend\n");
         close(client_sock);
         return;
     }
