@@ -312,7 +312,6 @@ static void handle_client(int client_sock) {
     char resp[256];
 
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
-
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi   = (verb_count > 1);
 
@@ -320,48 +319,54 @@ static void handle_client(int client_sock) {
 
     const char *status = get_random_status();
 
-    if (is_multi) {
+    if (!is_multi) {
+        /* Modo normal - fallback simples */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+        consume_headers(client_sock);
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+    } else {
+        /* === MODO MULTI-STATUS - O MAIS AGRESSIVO POSSÍVEL === */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
-        /* 101 para cada verbo */
         for (int i = 0; i < verb_count; i++) {
             status = get_random_status();
             snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo rápido do handshake */
+        /* Consumo mínimo do handshake */
         fprintf(stderr, "[multi] Consumindo handshake...\n");
-        int total = 0;
         char drain[16384];
-        for (int i = 0; i < 15; i++) {
+        int total = 0;
+        for (int i = 0; i < 12; i++) {
             ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
             if (n <= 0) break;
             total += n;
             fprintf(stderr, "[multi] +%ld (total %d)\n", n, total);
-            if (count_http_verbs(drain, n) == 0 && total > 300) break;
+            if (total > 350) break;
         }
         fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
-        /* Conecta no backend ANTES do 200 */
-        BackendRule *backend = detect_backend("", 0); // força fallback SSH
+        /* Conecta no backend SSH imediatamente */
+        BackendRule *backend = &CONFIG.backends[1]; // força o fallback SSH
         fprintf(stderr, "[multi] Conectando SSH: %s:%d\n", backend->host, backend->port);
 
         int server_sock = connect_backend(backend->host, backend->port);
         if (server_sock < 0) {
+            fprintf(stderr, "[ERRO] Falha ao conectar SSH\n");
             close(client_sock);
             return;
         }
 
-        /* Envia 200 e já tunela */
+        /* Envia 200 OK */
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        fprintf(stderr, "[multi] 200 OK enviado → INICIANDO TÚNEL AGORA\n");
+        fprintf(stderr, "[multi] 200 OK enviado → Túnel INICIANDO AGORA\n");
 
-        usleep(10000); // 10ms apenas
-
-        /* Tunelamento imediato */
+        /* INICIA TÚNEL IMEDIATAMENTE (sem usleep) */
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
         int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
@@ -376,6 +381,27 @@ static void handle_client(int client_sock) {
         close(server_sock);
         return;
     }
+
+    /* Tunelamento para modo normal */
+    char p[BUFFER_SIZE] = {0};
+    peek_data(client_sock, p, sizeof(p)-1);
+    BackendRule *b = detect_backend(p, strlen(p));
+    int s = connect_backend(b->host, b->port);
+    if (s < 0) { close(client_sock); return; }
+
+    pthread_t t1, t2;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = s;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = s; s2c[1] = client_sock;
+
+    pthread_create(&t1, NULL, transfer, c2s);
+    pthread_create(&t2, NULL, transfer, s2c);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    close(client_sock);
+    close(s);
+}
 
     /* Modo normal (não multi) */
     snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
