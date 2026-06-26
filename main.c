@@ -16,9 +16,9 @@
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      255369  /* aumentado de 4096 para melhor throughput */
+#define BUFFER_SIZE      255369
 #define PEEK_TIMEOUT     5
-#define CONNECT_TIMEOUT  10      /* segundos máximos para connect() ao backend */
+#define CONNECT_TIMEOUT  10
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
 
@@ -45,12 +45,10 @@ static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
 static ProxyConfig       CONFIG         = {0};
 
-/* Reload via SIGHUP */
 static volatile sig_atomic_t  reload_flag  = 0;
 static int                    saved_argc   = 0;
 static char                 **saved_argv   = NULL;
 
-/* Proteção de leitura/escrita da CONFIG durante reload */
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
@@ -103,7 +101,6 @@ static void parse_args(int argc, char *argv[]) {
         }
     }
 
-    /* Defaults se nada foi passado */
     if (new_cfg.backend_count == 0) {
         strcpy(new_cfg.backends[0].pattern, "SSH");
         strcpy(new_cfg.backends[0].host,    "0.0.0.0");
@@ -118,7 +115,6 @@ static void parse_args(int argc, char *argv[]) {
         new_cfg.status_count  = 1;
     }
 
-    /* Troca atômica da configuração */
     pthread_rwlock_wrlock(&config_lock);
     free_config(&CONFIG);
     CONFIG         = new_cfg;
@@ -130,19 +126,11 @@ static void parse_args(int argc, char *argv[]) {
 /* ------------------------------------------------------------------ */
 /* Handlers de sinal                                                    */
 /* ------------------------------------------------------------------ */
-
-/*
- * SIGHUP: sinaliza reload. accept() retornará EINTR (SA_RESTART desligado)
- * e o loop principal verificará reload_flag antes do próximo accept.
- */
 static void handle_sighup(int sig) {
     (void)sig;
     reload_flag = 1;
 }
 
-/*
- * SIGCHLD: recolhe processos filhos zumbis sem bloquear.
- */
 static void handle_sigchld(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -160,10 +148,6 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
-/*
- * Transfere dados de fds[0] → fds[1] em loop (trata writes parciais).
- * Não fecha os fds — isso fica a cargo do processo pai após o join.
- */
 static void *transfer(void *arg) {
     int    *fds = (int *)arg;
     char    buf[BUFFER_SIZE];
@@ -216,13 +200,8 @@ static BackendRule *detect_backend(const char *data, int len) {
 }
 
 /* ------------------------------------------------------------------ */
-/* MELHORIA 1 — connect() ao backend com timeout + suporte IPv4/IPv6   */
+/* connect_backend com timeout e suporte IPv4/IPv6                     */
 /* ------------------------------------------------------------------ */
-/*
- * Cria um socket para o backend detectando automaticamente se o host
- * é um endereço IPv4 ou IPv6. Usa O_NONBLOCK + select() para garantir
- * que a tentativa de conexão não bloqueie mais que CONNECT_TIMEOUT s.
- */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr    = {0};
     socklen_t               saddr_len;
@@ -231,7 +210,6 @@ static int connect_backend(const char *host, int port) {
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
-    /* Tenta interpretar o host como IPv6 primeiro, depois IPv4 */
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
         family          = AF_INET6;
         s6->sin6_family = AF_INET6;
@@ -250,7 +228,6 @@ static int connect_backend(const char *host, int port) {
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("[backend] socket"); return -1; }
 
-    /* Coloca em modo não-bloqueante para aplicar o timeout */
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -262,7 +239,6 @@ static int connect_backend(const char *host, int port) {
     }
 
     if (r != 0) {
-        /* Aguarda o socket ficar gravável ou o timeout expirar */
         fd_set         wfds;
         struct timeval tv = {CONNECT_TIMEOUT, 0};
         FD_ZERO(&wfds);
@@ -275,7 +251,6 @@ static int connect_backend(const char *host, int port) {
             return -1;
         }
 
-        /* Verifica se o connect realmente teve êxito */
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
@@ -287,9 +262,71 @@ static int connect_backend(const char *host, int port) {
         }
     }
 
-    /* Restaura modo bloqueante para o uso normal de I/O */
     fcntl(sock, F_SETFL, flags);
     return sock;
+}
+
+/* ------------------------------------------------------------------ */
+/* Detecção de requisição multi-status                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Conta quantos "verbos HTTP" existem no payload bruto.
+ * Verbos reconhecidos: GET, POST, HEAD, OPTIONS, CONNECT,
+ *                      ACL, CHECKIN, UNLOCK, PROPFIND, SUBSCRIBE.
+ *
+ * Retorna o número de verbos encontrados (>1 = requisição multi-status).
+ */
+static int count_http_verbs(const char *buf, int len) {
+    if (len <= 0) return 0;
+
+    static const char *VERBS[] = {
+        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ",
+        "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ", "SUBSCRIBE ",
+        NULL
+    };
+
+    int count = 0;
+
+    /* Varre o buffer linha a linha (suporta \r\n e \n) */
+    const char *p   = buf;
+    const char *end = buf + len;
+
+    while (p < end) {
+        /* Avança até o início de uma nova linha */
+        for (int v = 0; VERBS[v]; v++) {
+            size_t vlen = strlen(VERBS[v]);
+            if ((size_t)(end - p) >= vlen &&
+                memcmp(p, VERBS[v], vlen) == 0)
+            {
+                count++;
+                break; /* não conta o mesmo offset duas vezes */
+            }
+        }
+        /* Avança para o próximo byte */
+        p++;
+    }
+    return count;
+}
+
+/*
+ * Drena (lê e descarta) dados disponíveis no socket com timeout curto.
+ * Usado para consumir o restante de um request multi-bloco sem bloquear.
+ */
+static void drain_socket(int sock) {
+    char        discard[4096];
+    struct timeval tv = {1, 0};   /* 1 segundo de timeout */
+    fd_set fds;
+
+    while (1) {
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        int sel = select(sock + 1, &fds, NULL, NULL, &tv);
+        if (sel <= 0) break;  /* timeout ou erro: para de drenar */
+
+        ssize_t n = recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
+        if (n <= 0) break;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -300,20 +337,60 @@ static void handle_client(int client_sock) {
     char        resp[256];
     const char *status = get_random_status();
 
-    /* Peek do request para detectar o header especial */
-    peek_data(client_sock, buf, sizeof(buf) - 1);
+    /* Peek do request inicial */
+    int peeked_init = peek_data(client_sock, buf, sizeof(buf) - 1);
+
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
+
+    /*
+     * Detecta se é uma requisição multi-status:
+     * → mais de 1 verbo HTTP no payload inicial
+     *   OU presença de marcadores conhecidos de múltiplos blocos.
+     */
+    int verb_count   = count_http_verbs(buf, peeked_init);
+    int is_multi     = (verb_count > 1);
+
+    /* Log de debug */
+    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d\n",
+            verb_count, is_multi, has_proxyc);
 
     if (has_proxyc) {
         /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        /* Consome o request da fila */
+        /* Consome o request */
         if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
             close(client_sock); return;
         }
+
+    } else if (is_multi) {
+        /*
+         * Modo multi-status:
+         *   1º 101  — responde ao primeiro bloco
+         *   drena   — consome todo o request multi-bloco
+         *   2º 101  — handshake final
+         *   200     — pronto para tunelar
+         *
+         * Este é o fluxo que o aplicativo TIM (e similares) espera.
+         */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+
+        /* Consome o payload multi-bloco completo */
+        drain_socket(client_sock);
+
+        /* Segundo 101 */
+        status = get_random_status();   /* pode rotacionar o status */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+
+        /* 200 — sinaliza que o túnel está pronto */
+        status = get_random_status();
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+
     } else {
         /* Modo padrão → 101 → consome request → 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
@@ -330,7 +407,6 @@ static void handle_client(int client_sock) {
     int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, peeked);
 
-    /* MELHORIA 1: connect com timeout e suporte IPv4/IPv6 */
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) { close(client_sock); return; }
 
@@ -348,16 +424,13 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* MELHORIA 4 — accept_loop sem thread wrapper (chamado direto do main) */
-/* MELHORIA 3 — verifica reload_flag antes de cada accept()            */
-/* MELHORIA 2 — aceita clientes IPv4 e IPv6 via sockaddr_storage       */
+/* accept_loop                                                          */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
     socklen_t               client_len = sizeof(client_addr);
 
     while (1) {
-        /* MELHORIA 3: reload de config via SIGHUP sem reiniciar o processo */
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
@@ -370,12 +443,11 @@ static void accept_loop(int server_sock) {
                                  (struct sockaddr *)&client_addr,
                                  &client_len);
         if (client_sock < 0) {
-            if (errno == EINTR) continue; /* sinal recebido — testa reload_flag */
+            if (errno == EINTR) continue;
             perror("accept");
             continue;
         }
 
-        /* Log do IP do cliente — MELHORIA 2: suporta IPv4 e IPv6 */
         char client_ip[INET6_ADDRSTRLEN] = {0};
         if (client_addr.ss_family == AF_INET6) {
             inet_ntop(AF_INET6,
@@ -394,12 +466,10 @@ static void accept_loop(int server_sock) {
             continue;
         }
         if (pid == 0) {
-            /* Processo filho */
             close(server_sock);
             handle_client(client_sock);
             exit(0);
         }
-        /* Processo pai */
         close(client_sock);
     }
 }
@@ -410,29 +480,21 @@ static void accept_loop(int server_sock) {
 int main(int argc, char *argv[]) {
     srand(time(NULL));
 
-    /* Ignora SIGPIPE: evita crash em writes para sockets fechados */
     signal(SIGPIPE, SIG_IGN);
 
-    /* Salva args para uso no reload via SIGHUP */
     saved_argc = argc;
     saved_argv = argv;
     parse_args(argc, argv);
 
-    /* MELHORIA 3: instala handler de SIGHUP para reload sem restart.
-     * SA_RESTART desligado → accept() retorna EINTR ao receber SIGHUP,
-     * permitindo que o loop verifique reload_flag imediatamente.         */
     struct sigaction sa_hup = {0};
     sa_hup.sa_handler = handle_sighup;
     sigaction(SIGHUP, &sa_hup, NULL);
 
-    /* Recolhe processos filhos zumbis automaticamente */
     struct sigaction sa_chld = {0};
     sa_chld.sa_handler = handle_sigchld;
     sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
-    /* MELHORIA 2: socket AF_INET6 com IPV6_V6ONLY = 0
-     * → aceita conexões IPv4 (como ::ffff:x.x.x.x) e IPv6 no mesmo fd. */
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
     if (server_sock < 0) { perror("socket"); return 1; }
 
@@ -459,7 +521,6 @@ int main(int argc, char *argv[]) {
            PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
 
-    /* MELHORIA 4: accept_loop chamado diretamente — sem thread wrapper */
     accept_loop(server_sock);
 
     pthread_rwlock_destroy(&config_lock);
