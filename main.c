@@ -43,6 +43,7 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
+static int               AGGRESSIVE_MODE = 0;
 static ProxyConfig       CONFIG         = {0};
 
 static volatile sig_atomic_t  reload_flag  = 0;
@@ -66,6 +67,7 @@ static void parse_args(int argc, char *argv[]) {
     ProxyConfig new_cfg = {0};
     int new_port = 80;
     char *new_def_status = "Switching Protocols";
+    int aggressive = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -94,6 +96,8 @@ static void parse_args(int argc, char *argv[]) {
                 rule = strtok(NULL, ",");
             }
             free(copy);
+        } else if (strcmp(argv[i], "--aggressive") == 0) {
+            aggressive = 1;
         }
     }
 
@@ -116,6 +120,7 @@ static void parse_args(int argc, char *argv[]) {
     CONFIG = new_cfg;
     PORT = new_port;
     DEFAULT_STATUS = new_def_status;
+    AGGRESSIVE_MODE = aggressive;
     pthread_rwlock_unlock(&config_lock);
 }
 
@@ -161,9 +166,9 @@ static int consume_headers(int sock) {
 static int count_http_verbs(const char *buf, int len) {
     if (len <= 0) return 0;
     static const char *VERBS[] = {
-        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ",
-        "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ", "SUBSCRIBE ",
-        NULL
+        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ", "PUT ", "DELETE ",
+        "PATCH ", "TRACE ", "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ",
+        "PROPPATCH ", "SUBSCRIBE ", "NOTIFY ", NULL
     };
     int count = 0;
     const char *p = buf;
@@ -285,23 +290,21 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Multi-Status + Modo Normal Original Preservado      */
+/* Handle Client - Versão Final                                         */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256];
 
-    /* Peek inicial */
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
-
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi   = (verb_count > 1);
 
-    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d | peeked=%d\n", 
-            verb_count, is_multi, has_proxyc, peeked);
+    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d aggressive=%d\n", 
+            verb_count, is_multi, has_proxyc, AGGRESSIVE_MODE);
 
     const char *status = get_random_status();
 
@@ -312,7 +315,6 @@ static void handle_client(int client_sock) {
         recv(client_sock, buf, BUFFER_SIZE, 0);
     }
     else if (is_multi) {
-        /* ====================== MULTI-STATUS ====================== */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -321,29 +323,25 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consome handshake */
         char drain[16384];
         int total = 0;
-        for (int i = 0; i < 12; i++) {
+        int max_loops = AGGRESSIVE_MODE ? 25 : 12;
+        for (int i = 0; i < max_loops; i++) {
             ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
             if (n <= 0) break;
             total += n;
-            if (total > 350) break;
+            if (total > 450) break;
         }
         fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
-        /* Força SSH no multi-status */
         BackendRule *backend = &CONFIG.backends[1];
         int server_sock = connect_backend(backend->host, backend->port);
-        if (server_sock < 0) {
-            close(client_sock); return;
-        }
+        if (server_sock < 0) { close(client_sock); return; }
 
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        /* Tunelamento */
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
         int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
@@ -358,7 +356,7 @@ static void handle_client(int client_sock) {
         return;
     }
     else {
-        /* ====================== MODO NORMAL (igual ao original) ====================== */
+        /* Modo Normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
@@ -370,15 +368,13 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Peek para detectar backend (usado tanto no normal quanto no proxyc) */
+    /* Tunelamento final */
     char peek[BUFFER_SIZE] = {0};
-    int peeked_final = peek_data(client_sock, peek, sizeof(peek) - 1);
-    BackendRule *backend = detect_backend(peek, peeked_final);
+    int p_len = peek_data(client_sock, peek, sizeof(peek) - 1);
+    BackendRule *backend = detect_backend(peek, p_len);
 
     int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) {
-        close(client_sock); return;
-    }
+    if (server_sock < 0) { close(client_sock); return; }
 
     pthread_t t1, t2;
     int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
@@ -394,7 +390,7 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Accept Loop & Main (mantido igual ao original)                       */
+/* Accept Loop                                                          */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
@@ -404,8 +400,8 @@ static void accept_loop(int server_sock) {
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
-            printf("[SIGHUP] Configuração recarregada | Multi-status: %d | Backends: %d\n",
-                   CONFIG.status_count, CONFIG.backend_count);
+            printf("[SIGHUP] Configuração recarregada | Multi-status: %d | Backends: %d | Aggressive: %d\n",
+                   CONFIG.status_count, CONFIG.backend_count, AGGRESSIVE_MODE);
         }
 
         int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -430,6 +426,9 @@ static void accept_loop(int server_sock) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Main                                                                 */
+/* ------------------------------------------------------------------ */
 int main(int argc, char *argv[]) {
     srand(time(NULL));
     signal(SIGPIPE, SIG_IGN);
@@ -468,9 +467,8 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("ProxyC rodando na porta %d (IPv4 + IPv6) | "
-           "Multi-status: %d | Backends: %d\n",
-           PORT, CONFIG.status_count, CONFIG.backend_count);
+    printf("ProxyC rodando na porta %d | Multi-status: %d | Backends: %d | Aggressive: %d\n",
+           PORT, CONFIG.status_count, CONFIG.backend_count, AGGRESSIVE_MODE);
     printf("Recarregar config: kill -HUP %d\n", getpid());
 
     accept_loop(server_sock);
