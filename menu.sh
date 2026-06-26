@@ -6,6 +6,7 @@
 
 PORTS_FILE="/opt/proxyc/ports"
 PROXY_BIN="/opt/proxyc/proxy"
+MENU_SELF="$0"
 
 # ── Cores ─────────────────────────────────────────────────────
 RED=$'\e[0;31m'
@@ -19,7 +20,15 @@ BOLD=$'\e[1m'
 DIM=$'\e[2m'
 RESET=$'\e[0m'
 
-# ── Funções Auxiliares ────────────────────────────────────────
+CURSOR_HIDE=$'\e[?25l'
+CURSOR_SHOW=$'\e[?25h'
+
+trap "printf '%s' '${CURSOR_SHOW}'; exit" INT TERM EXIT
+
+# ═══════════════════════════════════════════════════════════════
+#  Funções Auxiliares
+# ═══════════════════════════════════════════════════════════════
+
 prompt() {
     printf "%s" "$1"
     read -r "$2"
@@ -30,6 +39,34 @@ pause() {
     read -r _
 }
 
+get_cpu_usage() {
+    local cpu
+    cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}' 2>/dev/null)
+    [ -z "$cpu" ] && cpu=$(vmstat 1 1 | awk 'NR==3{print 100 - $15}' 2>/dev/null)
+    printf "%.0f" "${cpu:-0}"
+}
+
+_get_mem_raw() {
+    free -m | awk 'NR==2{ if($2>0) printf "%d %d %d", $3*100/$2, $3, $2; else print "0 0 0" }'
+}
+
+get_mem_info() {
+    _get_mem_raw | awk '{printf "%d%% (%d/%d MB)", $1, $2, $3}'
+}
+
+get_color_bar() {
+    local pct=$1 filled=$((pct*20/100)) empty=$((20-filled)) bar=""
+    local color
+    [ "$pct" -ge 90 ] && color=$RED || [ "$pct" -ge 60 ] && color=$YELLOW || color=$GREEN
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    printf "%s%s%s" "$color" "$bar" "$RESET"
+}
+
+is_port_in_use() {
+    ss -tuln 2>/dev/null | grep -q ":$1\b"
+}
+
 get_port_status_symbol() {
     if systemctl is-active --quiet "proxyc${1}.service" 2>/dev/null; then
         printf "%s●%s" "$GREEN" "$RESET"
@@ -38,11 +75,10 @@ get_port_status_symbol() {
     fi
 }
 
-is_port_in_use() {
-    ss -tuln 2>/dev/null | grep -q ":$1\b"
-}
+# ═══════════════════════════════════════════════════════════════
+#  Adicionar Porta com Modo Agressivo
+# ═══════════════════════════════════════════════════════════════
 
-# ── Adicionar Porta com Modo Agressivo ───────────────────────
 add_proxy_port() {
     local port=$1 status=${2:-"C"} aggressive=${3:-0}
 
@@ -78,13 +114,22 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Menu Principal
+#  Menu Completo (igual ao original)
 # ═══════════════════════════════════════════════════════════════
 
 show_menu() {
     clear
     printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
-    printf "%s║%s             %sProxy C — Gerenciador%s                     %s║%s\n" "$CYAN" "$RESET" "$BOLD$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s %s%s Proxy C  %s%sv1.4%s                 %suptime: %-18s%s%s║%s\n" \
+        "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "$DIM" "$RESET" \
+        "$DIM" "$(uptime -p 2>/dev/null | sed 's/up //')" "$RESET" "$CYAN" "$RESET"
+    printf "%s╠══════════════════════════════════════════════════════════════╣%s\n" "$CYAN" "$RESET"
+
+    printf "%s║%s  %sCPU%s  %s  %3s%%                              %s║%s\n" \
+        "$CYAN" "$RESET" "$DIM" "$RESET" "$(get_color_bar "$(get_cpu_usage)")" "$(get_cpu_usage)" "$CYAN" "$RESET"
+    printf "%s║%s  %sMEM%s  %s  %-20s            %s║%s\n" \
+        "$CYAN" "$RESET" "$DIM" "$RESET" "$(get_color_bar "$(get_mem_info | cut -d'%' -f1)")" "$(get_mem_info)" "$CYAN" "$RESET"
+
     printf "%s╠══════════════════════════════════════════════════════════════╣%s\n" "$CYAN" "$RESET"
 
     printf "%s║%s   %s1%s  %sAbrir porta%s           %s2%s  %sFechar porta%s                   %s║%s\n" \
@@ -93,7 +138,7 @@ show_menu() {
         "$CYAN" "$RESET" "$YELLOW" "$RESET" "$WHITE" "$RESET" "$YELLOW" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s5%s  %sConexões por porta%s    %s6%s  %sPortas da máquina%s              %s║%s\n" \
         "$CYAN" "$RESET" "$BLUE" "$RESET" "$WHITE" "$RESET" "$BLUE" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    printf "%s║%s   %s7%s  %sAtualizar proxy%s       %s8%s  %shtop%s                           %s║%s\n" \
+    printf "%s║%s   %s7%s  %sAtualizar proxy%s       %s8%s  %sGerenciador(htop)%s              %s║%s\n" \
         "$CYAN" "$RESET" "$MAGENTA" "$RESET" "$WHITE" "$RESET" "$BLUE" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
     printf "%s║%s   %s9%s  %sMenu SSH%s              %s0%s  %sSair%s                           %s║%s\n" \
         "$CYAN" "$RESET" "$CYAN" "$RESET" "$WHITE" "$RESET" "$RED" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
@@ -103,7 +148,7 @@ show_menu() {
     prompt "   ${YELLOW}→ Selecione uma opção: ${RESET}" option
 
     case $option in
-        1)  # Abrir porta
+        1)  # Abrir porta com Modo Agressivo
             clear
             echo
             prompt "  ${CYAN}Porta:${RESET} " port
@@ -134,7 +179,7 @@ show_menu() {
             pause
             ;;
 
-        3)  # Reiniciar
+        3)  # Reiniciar porta
             clear
             echo
             prompt "  ${CYAN}Porta:${RESET} " port
@@ -156,7 +201,7 @@ show_menu() {
             ;;
 
         5|6|7|8|9)
-            echo "${YELLOW}  Função em desenvolvimento...${RESET}"
+            echo "${YELLOW}  Esta função ainda está em desenvolvimento.${RESET}"
             pause
             ;;
 
