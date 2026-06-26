@@ -340,34 +340,28 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* === CONSUMO INTELIGENTE PARA MULTI-STATUS === */
+        /* Consumo inteligente */
         fprintf(stderr, "[multi] Iniciando consumo inteligente...\n");
         
         int total_consumed = 0;
         char drain_buf[16384];
-        int max_loops = 30;
         int loops = 0;
 
-        while (loops < max_loops) {
+        while (loops < 40) {
             loops++;
             ssize_t n = recv(client_sock, drain_buf, sizeof(drain_buf), 0);
-            if (n <= 0) {
-                fprintf(stderr, "[multi] recv retornou %ld - parando\n", n);
-                break;
-            }
+            if (n <= 0) break;
 
             total_consumed += n;
             fprintf(stderr, "[multi] Consumido +%ld bytes (total: %d)\n", n, total_consumed);
 
-            /* Se ainda tiver verbo HTTP, continua consumindo */
             if (count_http_verbs(drain_buf, n) > 0) {
                 fprintf(stderr, "[multi] Ainda tem verbo HTTP - continuando...\n");
                 continue;
             }
 
-            /* Se não tem mais verbos HTTP por 2 loops seguidos, assume que acabou o handshake */
-            if (loops >= 2) {
-                fprintf(stderr, "[multi] Nenhum verbo HTTP encontrado - handshake finalizado\n");
+            if (loops >= 3) {
+                fprintf(stderr, "[multi] Handshake finalizado\n");
                 break;
             }
         }
@@ -380,29 +374,37 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
     else {
-        /* Modo normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-
         consume_headers(client_sock);
-
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    usleep(120000);  /* 120ms - importante para o TIM */
+    /* === AGUARDA PAYLOAD REAL (IMPORTANTE) === */
+    fprintf(stderr, "[multi] Aguardando payload real após 200 OK...\n");
+    usleep(150000);  // 150ms
 
-    /* Peek final */
+    /* Peek com várias tentativas */
     char peek_payload[BUFFER_SIZE] = {0};
-    int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
+    int peeked_payload = 0;
+    int attempts = 0;
 
-    fprintf(stderr, "[backend detect] peeked_payload = %d bytes\n", peeked_payload);
-    if (peeked_payload > 0) {
-        if (peeked_payload < 200) {
-            fprintf(stderr, "[payload preview] %.150s\n", peek_payload);
-        } else {
-            fprintf(stderr, "[payload preview] %d bytes (provavelmente binário SSH/VPN)\n", peeked_payload);
+    while (attempts < 8 && peeked_payload == 0) {
+        attempts++;
+        peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
+        if (peeked_payload == 0) {
+            usleep(50000);  // 50ms entre tentativas
         }
+    }
+
+    fprintf(stderr, "[backend detect] peeked_payload = %d bytes (após %d tentativas)\n", 
+            peeked_payload, attempts);
+
+    if (peeked_payload > 0) {
+        fprintf(stderr, "[payload preview] %d bytes - OK\n", peeked_payload);
+    } else {
+        fprintf(stderr, "[payload preview] Nenhum dado visível ainda - usando fallback\n");
     }
 
     BackendRule *backend = detect_backend(peek_payload, peeked_payload);
@@ -410,7 +412,7 @@ static void handle_client(int client_sock) {
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
-        fprintf(stderr, "[ERRO] Falha ao conectar no backend\n");
+        fprintf(stderr, "[ERRO] Falha ao conectar backend\n");
         close(client_sock);
         return;
     }
@@ -428,7 +430,6 @@ static void handle_client(int client_sock) {
 
     close(client_sock);
     close(server_sock);
-
 }
 
 /* ------------------------------------------------------------------ */
