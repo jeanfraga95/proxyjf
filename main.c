@@ -285,7 +285,7 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Otimizada para TIM                            */
+/* Handle Client - Multi-Status OK + Modo Normal Melhorado              */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
@@ -300,7 +300,7 @@ static void handle_client(int client_sock) {
     const char *status = get_random_status();
 
     if (is_multi) {
-        /* ====================== MODO MULTI-STATUS (mantido bom) ====================== */
+        /* ====================== MODO MULTI-STATUS ====================== */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -351,13 +351,12 @@ static void handle_client(int client_sock) {
         return;
     }
 
-    /* ====================== MODO NORMAL (melhorado) ====================== */
+    /* ====================== MODO NORMAL ====================== */
     fprintf(stderr, "[normal] Modo simples detectado\n");
 
     snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
     write(client_sock, resp, strlen(resp));
 
-    /* Consome headers de forma confiável */
     consume_headers(client_sock);
 
     snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
@@ -365,7 +364,6 @@ static void handle_client(int client_sock) {
 
     fprintf(stderr, "[normal] 200 OK enviado - Tunelando...\n");
 
-    /* Pequeno delay + peek para detectar backend */
     usleep(40000); // 40ms
 
     char p[BUFFER_SIZE] = {0};
@@ -395,40 +393,8 @@ static void handle_client(int client_sock) {
     close(server_sock);
 }
 
-    /* Modo Normal */
-    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-    write(client_sock, resp, strlen(resp));
-
-    consume_headers(client_sock);
-
-    snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-    write(client_sock, resp, strlen(resp));
-
-    char p[BUFFER_SIZE] = {0};
-    peek_data(client_sock, p, sizeof(p)-1);
-    BackendRule *b = detect_backend(p, strlen(p));
-    int s = connect_backend(b->host, b->port);
-    if (s < 0) {
-        close(client_sock);
-        return;
-    }
-
-    pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = s;
-    int *s2c = malloc(2 * sizeof(int)); s2c[0] = s; s2c[1] = client_sock;
-
-    pthread_create(&t1, NULL, transfer, c2s);
-    pthread_create(&t2, NULL, transfer, s2c);
-
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
-
-    close(client_sock);
-    close(s);
-}
-
 /* ------------------------------------------------------------------ */
-/* Accept Loop & Main                                                   */
+/* Accept Loop                                                          */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
@@ -463,6 +429,9 @@ static void accept_loop(int server_sock) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Main                                                                 */
+/* ------------------------------------------------------------------ */
 int main(int argc, char *argv[]) {
     srand(time(NULL));
     signal(SIGPIPE, SIG_IGN);
