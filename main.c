@@ -334,39 +334,41 @@ static void handle_client(int client_sock) {
     else if (is_multi) {
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
-        /* Responde 101 para cada verbo */
         for (int i = 0; i < verb_count; i++) {
             status = get_random_status();
             snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
             write(client_sock, resp, strlen(resp));
         }
 
-        /* === CONSUMO AGRESSIVO PARA MULTI-STATUS === */
-        fprintf(stderr, "[multi] Iniciando consumo agressivo de headers...\n");
+        /* === CONSUMO INTELIGENTE PARA MULTI-STATUS === */
+        fprintf(stderr, "[multi] Iniciando consumo inteligente...\n");
         
         int total_consumed = 0;
-        char drain_buf[8192];
-        int attempts = 0;
+        char drain_buf[16384];
+        int max_loops = 30;
+        int loops = 0;
 
-        while (attempts < 15) {  // máximo 15 tentativas
-            attempts++;
+        while (loops < max_loops) {
+            loops++;
             ssize_t n = recv(client_sock, drain_buf, sizeof(drain_buf), 0);
-            if (n <= 0) break;
+            if (n <= 0) {
+                fprintf(stderr, "[multi] recv retornou %ld - parando\n", n);
+                break;
+            }
 
             total_consumed += n;
             fprintf(stderr, "[multi] Consumido +%ld bytes (total: %d)\n", n, total_consumed);
 
-            /* Se encontrou dados binários (não HTTP), para de consumir */
-            if (n >= 4 && 
-                (drain_buf[0] < 32 || drain_buf[0] > 126 || 
-                 drain_buf[1] < 32 || drain_buf[1] > 126)) {
-                fprintf(stderr, "[multi] Detectado possível payload binário/real - parando consumo\n");
-                break;
+            /* Se ainda tiver verbo HTTP, continua consumindo */
+            if (count_http_verbs(drain_buf, n) > 0) {
+                fprintf(stderr, "[multi] Ainda tem verbo HTTP - continuando...\n");
+                continue;
             }
 
-            /* Se ainda tem verbos HTTP, continua consumindo */
-            if (count_http_verbs(drain_buf, n) > 0) {
-                continue;
+            /* Se não tem mais verbos HTTP por 2 loops seguidos, assume que acabou o handshake */
+            if (loops >= 2) {
+                fprintf(stderr, "[multi] Nenhum verbo HTTP encontrado - handshake finalizado\n");
+                break;
             }
         }
 
@@ -382,32 +384,33 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        consume_headers(client_sock);   // mantemos a função antiga para modo normal
+        consume_headers(client_sock);
 
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    usleep(80000);  // 80ms - dá tempo do app enviar payload real
+    usleep(120000);  /* 120ms - importante para o TIM */
 
-    /* Peek final para detectar backend */
+    /* Peek final */
     char peek_payload[BUFFER_SIZE] = {0};
     int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
 
     fprintf(stderr, "[backend detect] peeked_payload = %d bytes\n", peeked_payload);
-    if (peeked_payload > 0 && peeked_payload < 150) {
-        fprintf(stderr, "[payload preview] %.120s\n", peek_payload);
-    } else if (peeked_payload > 0) {
-        fprintf(stderr, "[payload preview] Dados binários ou longos (%d bytes) - OK\n", peeked_payload);
+    if (peeked_payload > 0) {
+        if (peeked_payload < 200) {
+            fprintf(stderr, "[payload preview] %.150s\n", peek_payload);
+        } else {
+            fprintf(stderr, "[payload preview] %d bytes (provavelmente binário SSH/VPN)\n", peeked_payload);
+        }
     }
 
     BackendRule *backend = detect_backend(peek_payload, peeked_payload);
-
     fprintf(stderr, "[backend] Usando %s:%d\n", backend->host, backend->port);
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
-        fprintf(stderr, "[ERRO] Falha ao conectar backend\n");
+        fprintf(stderr, "[ERRO] Falha ao conectar no backend\n");
         close(client_sock);
         return;
     }
@@ -425,6 +428,7 @@ static void handle_client(int client_sock) {
 
     close(client_sock);
     close(server_sock);
+
 }
 
 /* ------------------------------------------------------------------ */
