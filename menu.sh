@@ -1,19 +1,12 @@
 #!/bin/bash
 
 # ═══════════════════════════════════════════════════════════════
-#  Proxy C — Menu de controle (com suporte a Modo Agressivo)
-#  Repositório: https://github.com/jeanfraga95/proxyjf
+#  Proxy C — Menu de controle (com Modo Agressivo)
 # ═══════════════════════════════════════════════════════════════
 
 PORTS_FILE="/opt/proxyc/ports"
 PROXY_BIN="/opt/proxyc/proxy"
 MENU_SELF="$0"
-
-REPO_OWNER="jeanfraga95"
-REPO_NAME="proxyjf"
-GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents"
-RAW_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
-SHA_CACHE="/opt/proxyc/.last_sha_main_c"
 
 # ── Cores ─────────────────────────────────────────────────────
 RED=$'\e[0;31m'
@@ -27,49 +20,69 @@ BOLD=$'\e[1m'
 DIM=$'\e[2m'
 RESET=$'\e[0m'
 
-# ── Trap ──────────────────────────────────────────────────────
-trap "printf '%s' '${CURSOR_SHOW}'; tput cnorm 2>/dev/null; exit" INT TERM EXIT
+CURSOR_HIDE=$'\e[?25l'
+CURSOR_SHOW=$'\e[?25h'
+
+trap "printf '%s' '${CURSOR_SHOW}'; exit" INT TERM EXIT
 
 # ═══════════════════════════════════════════════════════════════
-#  Utilitários (mantidos)
+#  Utilitários
 # ═══════════════════════════════════════════════════════════════
 
-get_cpu_usage() { ... }   # (mesmo código anterior)
+get_cpu_usage() {
+    local cpu
+    cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}' 2>/dev/null)
+    [ -z "$cpu" ] && cpu=$(vmstat 1 1 | awk 'NR==3{print 100 - $15}' 2>/dev/null)
+    printf "%.0f" "${cpu:-0}"
+}
 
-# ... (todas as funções get_mem, get_color_bar, etc. permanecem iguais)
+get_mem_info() {
+    free -m | awk 'NR==2{printf "%d%% (%d/%d MB)", $3*100/$2, $3, $2}'
+}
+
+get_color_bar() {
+    local pct=$1 filled=$((pct*20/100)) empty=$((20-filled)) bar=""
+    local color
+    [ "$pct" -ge 90 ] && color=$RED || [ "$pct" -ge 60 ] && color=$YELLOW || color=$GREEN
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    printf "%s%s%s" "$color" "$bar" "$RESET"
+}
+
+is_port_in_use() {
+    ss -tuln 2>/dev/null | grep -q ":$1\b"
+}
+
+get_port_status_symbol() {
+    if systemctl is-active --quiet "proxyc${1}.service" 2>/dev/null; then
+        printf "%s●%s" "$GREEN" "$RESET"
+    else
+        printf "%s●%s" "$RED" "$RESET"
+    fi
+}
 
 # ═══════════════════════════════════════════════════════════════
-#  Gerenciamento de portas com Modo Agressivo
+#  Adicionar Porta com Modo Agressivo
 # ═══════════════════════════════════════════════════════════════
 
 add_proxy_port() {
     local port=$1 status=${2:-"C"} aggressive=${3:-0}
 
     if is_port_in_use "$port"; then
-        echo "${YELLOW}  ⚠  A porta ${port} já está em uso.${RESET}"
+        echo "${YELLOW}  ⚠  Porta ${port} já está em uso.${RESET}"
         return 1
     fi
 
     local cmd="${PROXY_BIN} --port ${port} --status ${status}"
     [ "$aggressive" -eq 1 ] && cmd="${cmd} --aggressive"
 
-    local svc="/etc/systemd/system/proxyc${port}.service"
-    cat <<EOF | sudo tee "$svc" > /dev/null
+    cat <<EOF | sudo tee "/etc/systemd/system/proxyc${port}.service" > /dev/null
 [Unit]
-Description=proxyc${port}
+Description=ProxyC ${port}
 After=network.target
 
 [Service]
 LimitNOFILE=infinity
-LimitNPROC=infinity
-LimitMEMLOCK=infinity
-LimitSTACK=infinity
-LimitCORE=0
-LimitAS=infinity
-LimitRSS=infinity
-LimitCPU=infinity
-LimitFSIZE=infinity
-Type=simple
 ExecStart=${cmd}
 Restart=always
 
@@ -79,83 +92,80 @@ EOF
 
     sudo systemctl daemon-reload
     sudo systemctl enable "proxyc${port}.service" >/dev/null 2>&1
-    sudo systemctl start  "proxyc${port}.service"
+    sudo systemctl start "proxyc${port}.service"
 
     echo "$port" >> "$PORTS_FILE"
-    echo "${GREEN}  ✔  Porta ${port} ativada com sucesso!${RESET}"
-    [ "$aggressive" -eq 1 ] && echo "     ${YELLOW}→ Modo Agressivo ativado${RESET}"
+    echo "${GREEN}  ✔  Porta ${port} aberta com sucesso!${RESET}"
+    [ "$aggressive" -eq 1 ] && echo "     ${YELLOW}→ Modo Agressivo ATIVADO${RESET}"
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Alterar status + Modo Agressivo
+#  Menu Principal
 # ═══════════════════════════════════════════════════════════════
 
-change_port_status() {
-    # ... (código anterior mantido)
-    # Adicione no final da função a opção de ativar/desativar agressivo
-    prompt "  ${CYAN}Ativar Modo Agressivo? (s/N):${RESET} " use_aggressive
-    if [[ "$use_aggressive" =~ ^[Ss]$ ]]; then
-        aggressive=1
-    else
-        aggressive=0
-    fi
-
-    local cmd="${PROXY_BIN} --port ${port} --status ${new_status}"
-    [ "$aggressive" -eq 1 ] && cmd="${cmd} --aggressive"
-
-    sudo sed -i "s|ExecStart=.*|ExecStart=${cmd}|" "$svc_file"
-    sudo systemctl daemon-reload
-    sudo systemctl restart "proxyc${port}.service"
-
-    echo "${GREEN}  ✔  Porta ${port} atualizada.${RESET}"
-    [ "$aggressive" -eq 1 ] && echo "     ${YELLOW}→ Modo Agressivo: ATIVADO${RESET}"
-}
-
-# ═══════════════════════════════════════════════════════════════
-#  Função principal de adicionar porta (com pergunta agressivo)
-# ═══════════════════════════════════════════════════════════════
-
-add_proxy_port_interactive() {
-    stop_live_header
+show_menu() {
     clear
-
     printf "%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$RESET"
-    printf "%s║%s  %s%s  Abrir Nova Porta%s%42s%s║%s\n" \
-        "$CYAN" "$RESET" "$BOLD" "$WHITE" "$RESET" "" "$CYAN" "$RESET"
-    printf "%s╚══════════════════════════════════════════════════════════════╝%s\n\n" "$CYAN" "$RESET"
+    printf "%s║%s             %sProxy C — Gerenciador%s                     %s║%s\n" "$CYAN" "$RESET" "$BOLD$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s╠══════════════════════════════════════════════════════════════╣%s\n" "$CYAN" "$RESET"
 
-    prompt "  ${CYAN}Porta (ex: 8080):${RESET} " port
-    while ! [[ $port =~ ^[0-9]+$ ]]; do
-        echo "${RED}  Porta inválida.${RESET}"
-        prompt "  ${CYAN}Porta:${RESET} " port
-    done
+    printf "%s║%s   %s1%s  %sAbrir Porta (com Agressivo)%s                        %s║%s\n" "$CYAN" "$RESET" "$GREEN" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s2%s  %sFechar Porta%s                                         %s║%s\n" "$CYAN" "$RESET" "$RED" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s3%s  %sReiniciar Porta%s                                      %s║%s\n" "$CYAN" "$RESET" "$YELLOW" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s4%s  %sAlterar Status%s                                       %s║%s\n" "$CYAN" "$RESET" "$BLUE" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s5%s  %sVer Conexões%s                                         %s║%s\n" "$CYAN" "$RESET" "$MAGENTA" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s║%s   %s0%s  %sSair%s                                                 %s║%s\n" "$CYAN" "$RESET" "$RED" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
+    printf "%s╚══════════════════════════════════════════════════════════════╝%s\n" "$CYAN" "$RESET"
+    echo
 
-    prompt "  ${CYAN}Status (ex: SSH, VPN, @rg0n):${RESET} " status
-    [ -z "$status" ] && status="C"
+    read -p "   ${YELLOW}→ Escolha uma opção: ${RESET}" option
 
-    prompt "  ${CYAN}Ativar Modo Agressivo? (s/N):${RESET} " agg
-    aggressive=0
-    [[ "$agg" =~ ^[Ss]$ ]] && aggressive=1
+    case $option in
+        1)
+            clear
+            echo
+            read -p "  ${CYAN}Porta: ${RESET}" port
+            read -p "  ${CYAN}Status (ex: SSH, VPN): ${RESET}" status
+            [ -z "$status" ] && status="C"
 
-    add_proxy_port "$port" "$status" "$aggressive"
-    pause
+            read -p "  ${CYAN}Ativar Modo Agressivo? (s/N): ${RESET}" agg
+            aggressive=0
+            [[ "$agg" =~ ^[Ss]$ ]] && aggressive=1
+
+            add_proxy_port "$port" "$status" "$aggressive"
+            echo; read -p "  Pressione Enter para continuar..."
+            ;;
+
+        2)
+            clear
+            echo
+            read -p "  ${CYAN}Porta para fechar: ${RESET}" port
+            sudo systemctl stop "proxyc${port}.service" 2>/dev/null
+            sudo rm -f "/etc/systemd/system/proxyc${port}.service"
+            sudo systemctl daemon-reload
+            sed -i "/^${port}$/d" "$PORTS_FILE"
+            echo "${GREEN}  ✔  Porta ${port} fechada.${RESET}"
+            echo; read -p "  Pressione Enter..."
+            ;;
+
+        0)
+            clear
+            exit 0
+            ;;
+
+        *)
+            echo "${RED}  Opção inválida!${RESET}"
+            sleep 1
+            ;;
+    esac
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Menu Principal Atualizado
+#  Loop Principal
 # ═══════════════════════════════════════════════════════════════
 
-draw_menu() {
-    # ... (cabeçalho mantido igual)
-    # Atualize as opções:
+[ ! -f "$PORTS_FILE" ] && sudo touch "$PORTS_FILE"
 
-    printf "%s║%s   %s1%s  %sAbrir porta (com agressivo)%s     %s2%s  %sFechar porta%s              %s║%s\n" \
-        "$CYAN" "$RESET" "$GREEN" "$RESET" "$WHITE" "$RESET" "$GREEN" "$RESET" "$WHITE" "$RESET" "$CYAN" "$RESET"
-    # ... resto do menu
-}
-
-# No loop principal, altere a opção 1:
-case $option in
-    1)  add_proxy_port_interactive ;;
-    # ... resto igual
-esac
+while true; do
+    show_menu
+done
