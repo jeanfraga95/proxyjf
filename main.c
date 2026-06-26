@@ -71,10 +71,8 @@ static void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             new_port = atoi(argv[++i]);
-
         } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
             new_def_status = argv[++i];
-
         } else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
             char *copy  = strdup(argv[++i]);
             char *token = strtok(copy, ",");
@@ -83,7 +81,6 @@ static void parse_args(int argc, char *argv[]) {
                 token = strtok(NULL, ",");
             }
             free(copy);
-
         } else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
             char *copy = strdup(argv[++i]);
             char *rule = strtok(copy, ",");
@@ -148,6 +145,79 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
+/* Consome apenas os headers HTTP (até \r\n\r\n ou \n\n) */
+static int consume_headers(int sock) {
+    char buffer[BUFFER_SIZE] = {0};
+    int total = 0;
+
+    while (1) {
+        ssize_t n = recv(sock, buffer + total, sizeof(buffer) - total - 1, 0);
+        if (n <= 0) break;
+
+        total += n;
+        buffer[total] = '\0';
+
+        if (strstr(buffer, "\r\n\r\n") || strstr(buffer, "\n\n"))
+            break;
+
+        if (total > BUFFER_SIZE - 4096) break; /* segurança */
+    }
+    return total;
+}
+
+static int count_http_verbs(const char *buf, int len) {
+    if (len <= 0) return 0;
+
+    static const char *VERBS[] = {
+        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ",
+        "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ", "SUBSCRIBE ",
+        NULL
+    };
+
+    int count = 0;
+    const char *p = buf;
+    const char *end = buf + len;
+
+    while (p < end) {
+        for (int v = 0; VERBS[v]; v++) {
+            size_t vlen = strlen(VERBS[v]);
+            if ((size_t)(end - p) >= vlen && memcmp(p, VERBS[v], vlen) == 0) {
+                count++;
+                break;
+            }
+        }
+        p++;
+    }
+    return count;
+}
+
+static const char *get_random_status(void) {
+    pthread_rwlock_rdlock(&config_lock);
+    const char *s = CONFIG.statuses[rand() % CONFIG.status_count];
+    pthread_rwlock_unlock(&config_lock);
+    return s;
+}
+
+static BackendRule *detect_backend(const char *data, int len) {
+    pthread_rwlock_rdlock(&config_lock);
+    int fallback = (CONFIG.backend_count > 1) ? 1 : 0;
+
+    if (len <= 0) {
+        pthread_rwlock_unlock(&config_lock);
+        return &CONFIG.backends[fallback];
+    }
+
+    for (int i = 0; i < CONFIG.backend_count; i++) {
+        if (CONFIG.backends[i].pattern[0] && strstr(data, CONFIG.backends[i].pattern)) {
+            BackendRule *r = &CONFIG.backends[i];
+            pthread_rwlock_unlock(&config_lock);
+            return r;
+        }
+    }
+    pthread_rwlock_unlock(&config_lock);
+    return &CONFIG.backends[fallback];
+}
+
 static void *transfer(void *arg) {
     int    *fds = (int *)arg;
     char    buf[BUFFER_SIZE];
@@ -168,58 +238,27 @@ done:
     return NULL;
 }
 
-static const char *get_random_status(void) {
-    pthread_rwlock_rdlock(&config_lock);
-    const char *s = CONFIG.statuses[rand() % CONFIG.status_count];
-    pthread_rwlock_unlock(&config_lock);
-    return s;
-}
-
-static BackendRule *detect_backend(const char *data, int len) {
-    pthread_rwlock_rdlock(&config_lock);
-
-    int fallback = (CONFIG.backend_count > 1) ? 1 : 0;
-
-    if (len <= 0) {
-        BackendRule *r = &CONFIG.backends[fallback];
-        pthread_rwlock_unlock(&config_lock);
-        return r;
-    }
-    for (int i = 0; i < CONFIG.backend_count; i++) {
-        if (CONFIG.backends[i].pattern[0] &&
-            strstr(data, CONFIG.backends[i].pattern))
-        {
-            BackendRule *r = &CONFIG.backends[i];
-            pthread_rwlock_unlock(&config_lock);
-            return r;
-        }
-    }
-    BackendRule *r = &CONFIG.backends[fallback];
-    pthread_rwlock_unlock(&config_lock);
-    return r;
-}
-
 /* ------------------------------------------------------------------ */
-/* connect_backend com timeout e suporte IPv4/IPv6                     */
+/* Conexão com backend                                                  */
 /* ------------------------------------------------------------------ */
 static int connect_backend(const char *host, int port) {
-    struct sockaddr_storage saddr    = {0};
-    socklen_t               saddr_len;
-    int                     family;
+    struct sockaddr_storage saddr = {0};
+    socklen_t saddr_len;
+    int family;
 
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
-        family          = AF_INET6;
+        family = AF_INET6;
         s6->sin6_family = AF_INET6;
         s6->sin6_port   = htons(port);
-        saddr_len       = sizeof(struct sockaddr_in6);
+        saddr_len = sizeof(struct sockaddr_in6);
     } else if (inet_pton(AF_INET, host, &s4->sin_addr) == 1) {
-        family         = AF_INET;
+        family = AF_INET;
         s4->sin_family = AF_INET;
         s4->sin_port   = htons(port);
-        saddr_len      = sizeof(struct sockaddr_in);
+        saddr_len = sizeof(struct sockaddr_in);
     } else {
         fprintf(stderr, "[backend] host inválido: '%s'\n", host);
         return -1;
@@ -239,7 +278,7 @@ static int connect_backend(const char *host, int port) {
     }
 
     if (r != 0) {
-        fd_set         wfds;
+        fd_set wfds;
         struct timeval tv = {CONNECT_TIMEOUT, 0};
         FD_ZERO(&wfds);
         FD_SET(sock, &wfds);
@@ -251,12 +290,11 @@ static int connect_backend(const char *host, int port) {
             return -1;
         }
 
-        int       so_err = 0;
+        int so_err = 0;
         socklen_t so_len = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
         if (so_err != 0) {
-            fprintf(stderr, "[backend] falha ao conectar em %s:%d — errno %d\n",
-                    host, port, so_err);
+            fprintf(stderr, "[backend] falha ao conectar em %s:%d — errno %d\n", host, port, so_err);
             close(sock);
             return -1;
         }
@@ -267,155 +305,78 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Detecção de requisição multi-status                                  */
-/* ------------------------------------------------------------------ */
-
-/*
- * Conta quantos "verbos HTTP" existem no payload bruto.
- * Verbos reconhecidos: GET, POST, HEAD, OPTIONS, CONNECT,
- *                      ACL, CHECKIN, UNLOCK, PROPFIND, SUBSCRIBE.
- *
- * Retorna o número de verbos encontrados (>1 = requisição multi-status).
- */
-static int count_http_verbs(const char *buf, int len) {
-    if (len <= 0) return 0;
-
-    static const char *VERBS[] = {
-        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ",
-        "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ", "SUBSCRIBE ",
-        NULL
-    };
-
-    int count = 0;
-
-    /* Varre o buffer linha a linha (suporta \r\n e \n) */
-    const char *p   = buf;
-    const char *end = buf + len;
-
-    while (p < end) {
-        /* Avança até o início de uma nova linha */
-        for (int v = 0; VERBS[v]; v++) {
-            size_t vlen = strlen(VERBS[v]);
-            if ((size_t)(end - p) >= vlen &&
-                memcmp(p, VERBS[v], vlen) == 0)
-            {
-                count++;
-                break; /* não conta o mesmo offset duas vezes */
-            }
-        }
-        /* Avança para o próximo byte */
-        p++;
-    }
-    return count;
-}
-
-/*
- * Drena (lê e descarta) dados disponíveis no socket com timeout curto.
- * Usado para consumir o restante de um request multi-bloco sem bloquear.
- */
-static void drain_socket(int sock) {
-    char        discard[4096];
-    struct timeval tv = {1, 0};   /* 1 segundo de timeout */
-    fd_set fds;
-
-    while (1) {
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        int sel = select(sock + 1, &fds, NULL, NULL, &tv);
-        if (sel <= 0) break;  /* timeout ou erro: para de drenar */
-
-        ssize_t n = recv(sock, discard, sizeof(discard), MSG_DONTWAIT);
-        if (n <= 0) break;
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Tratamento do cliente                                                */
+/* Tratamento do cliente - VERSÃO CORRIGIDA                             */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
-    char        buf[BUFFER_SIZE] = {0};
-    char        resp[256];
-    const char *status = get_random_status();
+    char buf[BUFFER_SIZE] = {0};
+    char resp[256];
 
-    /* Peek do request inicial */
-    int peeked_init = peek_data(client_sock, buf, sizeof(buf) - 1);
+    /* Peek inicial sem consumir */
+    int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
 
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
-    /*
-     * Detecta se é uma requisição multi-status:
-     * → mais de 1 verbo HTTP no payload inicial
-     *   OU presença de marcadores conhecidos de múltiplos blocos.
-     */
-    int verb_count   = count_http_verbs(buf, peeked_init);
-    int is_multi     = (verb_count > 1);
+    int verb_count = count_http_verbs(buf, peeked);
+    int is_multi   = (verb_count > 1);
 
-    /* Log de debug */
-    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d\n",
-            verb_count, is_multi, has_proxyc);
+    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d\n", verb_count, is_multi, has_proxyc);
+
+    const char *status = get_random_status();
 
     if (has_proxyc) {
-        /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        /* Consome o request */
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
+        recv(client_sock, buf, BUFFER_SIZE, 0); /* consome */
+    }
+    else if (is_multi) {
+        /* Modo Multi-Status Corrigido */
+        for (int i = 0; i < verb_count; i++) {
+            status = get_random_status();
+            snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+            write(client_sock, resp, strlen(resp));
         }
 
-    } else if (is_multi) {
-        /*
-         * Modo multi-status:
-         *   1º 101  — responde ao primeiro bloco
-         *   drena   — consome todo o request multi-bloco
-         *   2º 101  — handshake final
-         *   200     — pronto para tunelar
-         *
-         * Este é o fluxo que o aplicativo TIM (e similares) espera.
-         */
-        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
+        /* Consome APENAS os headers */
+        consume_headers(client_sock);
 
-        /* Consome o payload multi-bloco completo */
-        drain_socket(client_sock);
-
-        /* Segundo 101 */
-        status = get_random_status();   /* pode rotacionar o status */
-        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
-
-        /* 200 — sinaliza que o túnel está pronto */
+        /* 200 final */
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-
-    } else {
-        /* Modo padrão → 101 → consome request → 200 */
+    }
+    else {
+        /* Modo normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
-        }
+
+        consume_headers(client_sock);
+
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Peek do próximo payload para escolher o backend */
-    char peek[BUFFER_SIZE] = {0};
-    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
-    BackendRule *backend = detect_backend(peek, peeked);
+    /* Peek do payload real para detectar backend */
+    char peek_payload[BUFFER_SIZE] = {0};
+    int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
+
+    BackendRule *backend = detect_backend(peek_payload, peeked_payload);
 
     int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) { close(client_sock); return; }
+    if (server_sock < 0) {
+        close(client_sock);
+        return;
+    }
 
+    /* Tunelamento */
     pthread_t t1, t2;
     int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
     int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
+
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
 
@@ -424,39 +385,25 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* accept_loop                                                          */
+/* Accept Loop                                                          */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
-    socklen_t               client_len = sizeof(client_addr);
+    socklen_t client_len = sizeof(client_addr);
 
     while (1) {
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
-            printf("[SIGHUP] Configuração recarregada | "
-                   "Multi-status: %d | Backends: %d\n",
+            printf("[SIGHUP] Configuração recarregada | Multi-status: %d | Backends: %d\n",
                    CONFIG.status_count, CONFIG.backend_count);
         }
 
-        int client_sock = accept(server_sock,
-                                 (struct sockaddr *)&client_addr,
-                                 &client_len);
+        int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
         if (client_sock < 0) {
             if (errno == EINTR) continue;
             perror("accept");
             continue;
-        }
-
-        char client_ip[INET6_ADDRSTRLEN] = {0};
-        if (client_addr.ss_family == AF_INET6) {
-            inet_ntop(AF_INET6,
-                      &((struct sockaddr_in6 *)&client_addr)->sin6_addr,
-                      client_ip, sizeof(client_ip));
-        } else {
-            inet_ntop(AF_INET,
-                      &((struct sockaddr_in *)&client_addr)->sin_addr,
-                      client_ip, sizeof(client_ip));
         }
 
         pid_t pid = fork();
@@ -475,7 +422,7 @@ static void accept_loop(int server_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* main                                                                 */
+/* Main                                                                 */
 /* ------------------------------------------------------------------ */
 int main(int argc, char *argv[]) {
     srand(time(NULL));
@@ -492,7 +439,7 @@ int main(int argc, char *argv[]) {
 
     struct sigaction sa_chld = {0};
     sa_chld.sa_handler = handle_sigchld;
-    sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
+    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
