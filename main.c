@@ -403,6 +403,27 @@ static void handle_client(int client_sock) {
     close(s);
 }
 
+    /* Tunelamento para modo normal */
+    char p[BUFFER_SIZE] = {0};
+    peek_data(client_sock, p, sizeof(p)-1);
+    BackendRule *b = detect_backend(p, strlen(p));
+    int s = connect_backend(b->host, b->port);
+    if (s < 0) { close(client_sock); return; }
+
+    pthread_t t1, t2;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = s;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = s; s2c[1] = client_sock;
+
+    pthread_create(&t1, NULL, transfer, c2s);
+    pthread_create(&t2, NULL, transfer, s2c);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    close(client_sock);
+    close(s);
+}
+
     /* Modo normal (não multi) */
     snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
     write(client_sock, resp, strlen(resp));
