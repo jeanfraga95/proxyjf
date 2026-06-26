@@ -319,15 +319,8 @@ static void handle_client(int client_sock) {
 
     const char *status = get_random_status();
 
-    if (!is_multi) {
-        /* Modo normal - fallback simples */
-        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
-        consume_headers(client_sock);
-        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
-    } else {
-        /* === MODO MULTI-STATUS - O MAIS AGRESSIVO POSSÍVEL === */
+    if (is_multi) {
+        /* ====================== MODO MULTI-STATUS ====================== */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -336,7 +329,7 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo mínimo do handshake */
+        /* Consumo do handshake */
         fprintf(stderr, "[multi] Consumindo handshake...\n");
         char drain[16384];
         int total = 0;
@@ -349,8 +342,8 @@ static void handle_client(int client_sock) {
         }
         fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
-        /* Conecta no backend SSH imediatamente */
-        BackendRule *backend = &CONFIG.backends[1]; // força o fallback SSH
+        /* Conecta SSH imediatamente */
+        BackendRule *backend = &CONFIG.backends[1];  // fallback SSH
         fprintf(stderr, "[multi] Conectando SSH: %s:%d\n", backend->host, backend->port);
 
         int server_sock = connect_backend(backend->host, backend->port);
@@ -366,7 +359,7 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
         fprintf(stderr, "[multi] 200 OK enviado → Túnel INICIANDO AGORA\n");
 
-        /* INICIA TÚNEL IMEDIATAMENTE (sem usleep) */
+        /* Tunelamento imediato */
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
         int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
@@ -381,6 +374,39 @@ static void handle_client(int client_sock) {
         close(server_sock);
         return;
     }
+
+    /* ====================== MODO NORMAL ====================== */
+    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+    write(client_sock, resp, strlen(resp));
+
+    consume_headers(client_sock);
+
+    snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+    write(client_sock, resp, strlen(resp));
+
+    /* Tunelamento modo normal */
+    char p[BUFFER_SIZE] = {0};
+    peek_data(client_sock, p, sizeof(p)-1);
+    BackendRule *b = detect_backend(p, strlen(p));
+    int s = connect_backend(b->host, b->port);
+    if (s < 0) {
+        close(client_sock);
+        return;
+    }
+
+    pthread_t t1, t2;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = s;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = s; s2c[1] = client_sock;
+
+    pthread_create(&t1, NULL, transfer, c2s);
+    pthread_create(&t2, NULL, transfer, s2c);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    close(client_sock);
+    close(s);
+}
 
     /* Tunelamento para modo normal */
     char p[BUFFER_SIZE] = {0};
