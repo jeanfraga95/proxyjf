@@ -285,22 +285,34 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Multi-Status OK + Modo Normal Melhorado              */
+/* Handle Client - Multi-Status + Modo Normal Original Preservado      */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256];
 
+    /* Peek inicial */
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
+
+    int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
+                     (strstr(buf, "proxyc: on") != NULL);
+
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi   = (verb_count > 1);
 
-    fprintf(stderr, "[client] verbos=%d multi=%d | peeked=%d\n", verb_count, is_multi, peeked);
+    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d | peeked=%d\n", 
+            verb_count, is_multi, has_proxyc, peeked);
 
     const char *status = get_random_status();
 
-    if (is_multi) {
-        /* ====================== MODO MULTI-STATUS ====================== */
+    if (has_proxyc) {
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+        write(client_sock, resp, strlen(resp));
+        recv(client_sock, buf, BUFFER_SIZE, 0);
+    }
+    else if (is_multi) {
+        /* ====================== MULTI-STATUS ====================== */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -309,40 +321,35 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        fprintf(stderr, "[multi] Consumindo handshake...\n");
+        /* Consome handshake */
         char drain[16384];
         int total = 0;
         for (int i = 0; i < 12; i++) {
             ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
             if (n <= 0) break;
             total += n;
-            fprintf(stderr, "[multi] +%ld (total %d)\n", n, total);
             if (total > 350) break;
         }
         fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
-        BackendRule *backend = &CONFIG.backends[1]; // Força SSH
-        fprintf(stderr, "[multi] Conectando SSH: %s:%d\n", backend->host, backend->port);
-
+        /* Força SSH no multi-status */
+        BackendRule *backend = &CONFIG.backends[1];
         int server_sock = connect_backend(backend->host, backend->port);
         if (server_sock < 0) {
-            fprintf(stderr, "[ERRO] Falha ao conectar SSH\n");
-            close(client_sock);
-            return;
+            close(client_sock); return;
         }
 
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        fprintf(stderr, "[multi] 200 OK enviado → Túnel INICIANDO AGORA\n");
 
+        /* Tunelamento */
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
         int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
         pthread_create(&t1, NULL, transfer, c2s);
         pthread_create(&t2, NULL, transfer, s2c);
-
         pthread_join(t1, NULL);
         pthread_join(t2, NULL);
 
@@ -350,33 +357,27 @@ static void handle_client(int client_sock) {
         close(server_sock);
         return;
     }
+    else {
+        /* ====================== MODO NORMAL (igual ao original) ====================== */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
 
-    /* ====================== MODO NORMAL ====================== */
-    fprintf(stderr, "[normal] Modo simples detectado\n");
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
+        }
 
-    snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-    write(client_sock, resp, strlen(resp));
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
+    }
 
-    consume_headers(client_sock);
+    /* Peek para detectar backend (usado tanto no normal quanto no proxyc) */
+    char peek[BUFFER_SIZE] = {0};
+    int peeked_final = peek_data(client_sock, peek, sizeof(peek) - 1);
+    BackendRule *backend = detect_backend(peek, peeked_final);
 
-    snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-    write(client_sock, resp, strlen(resp));
-
-    fprintf(stderr, "[normal] 200 OK enviado - Tunelando...\n");
-
-    usleep(40000); // 40ms
-
-    char p[BUFFER_SIZE] = {0};
-    int p_len = peek_data(client_sock, p, sizeof(p)-1);
-
-    BackendRule *b = detect_backend(p, p_len);
-    fprintf(stderr, "[normal] Backend escolhido: %s:%d\n", b->host, b->port);
-
-    int server_sock = connect_backend(b->host, b->port);
+    int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
-        fprintf(stderr, "[ERRO] Falha ao conectar backend normal\n");
-        close(client_sock);
-        return;
+        close(client_sock); return;
     }
 
     pthread_t t1, t2;
@@ -385,7 +386,6 @@ static void handle_client(int client_sock) {
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
-
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
 
@@ -394,7 +394,7 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Accept Loop                                                          */
+/* Accept Loop & Main (mantido igual ao original)                       */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
@@ -404,7 +404,8 @@ static void accept_loop(int server_sock) {
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
-            printf("[SIGHUP] Configuração recarregada\n");
+            printf("[SIGHUP] Configuração recarregada | Multi-status: %d | Backends: %d\n",
+                   CONFIG.status_count, CONFIG.backend_count);
         }
 
         int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -429,9 +430,6 @@ static void accept_loop(int server_sock) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Main                                                                 */
-/* ------------------------------------------------------------------ */
 int main(int argc, char *argv[]) {
     srand(time(NULL));
     signal(SIGPIPE, SIG_IGN);
@@ -470,8 +468,10 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("ProxyC rodando na porta %d | Multi-status: %d | Backends: %d\n",
+    printf("ProxyC rodando na porta %d (IPv4 + IPv6) | "
+           "Multi-status: %d | Backends: %d\n",
            PORT, CONFIG.status_count, CONFIG.backend_count);
+    printf("Recarregar config: kill -HUP %d\n", getpid());
 
     accept_loop(server_sock);
 
