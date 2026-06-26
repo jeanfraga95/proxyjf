@@ -358,7 +358,7 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
         fprintf(stderr, "[multi] 200 OK enviado → Tunelando imediatamente\n");
 
-        usleep(20000); // 20ms apenas
+        usleep(10000); // 20ms apenas
     }
     else {
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
