@@ -323,6 +323,9 @@ static void handle_client(int client_sock) {
 
     const char *status = get_random_status();
 
+    BackendRule *backend = NULL;
+    int server_sock = -1;
+
     if (has_proxyc) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
@@ -338,12 +341,11 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo completo do handshake */
+        /* Consumo do handshake */
         fprintf(stderr, "[multi] Consumindo handshake...\n");
         int total = 0;
         char drain[16384];
-
-        for (int i = 0; i < 25; i++) {
+        for (int i = 0; i < 20; i++) {
             ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
             if (n <= 0) break;
             total += n;
@@ -352,15 +354,26 @@ static void handle_client(int client_sock) {
         }
         fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
+        /* === CONECTA NO BACKEND ANTES DO 200 === */
+        char peek_temp[BUFFER_SIZE] = {0};
+        peek_data(client_sock, peek_temp, sizeof(peek_temp)-1);
+        backend = detect_backend(peek_temp, strlen(peek_temp));
+
+        fprintf(stderr, "[multi] Conectando backend ANTES do 200: %s:%d\n", backend->host, backend->port);
+        server_sock = connect_backend(backend->host, backend->port);
+        if (server_sock < 0) {
+            close(client_sock);
+            return;
+        }
+
         /* 200 OK */
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
-        fprintf(stderr, "[multi] 200 OK enviado → Tunelando imediatamente\n");
-
-        usleep(10000); // 20ms apenas
+        fprintf(stderr, "[multi] 200 OK enviado - Túnel pronto\n");
     }
     else {
+        /* Modo normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         consume_headers(client_sock);
@@ -368,23 +381,19 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* === TUNELAMENTO (mesmo se peek for 0) === */
-    char peek_payload[BUFFER_SIZE] = {0};
-    int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
-
-    fprintf(stderr, "[tunnel] peeked = %d bytes\n", peeked_payload);
-
-    BackendRule *backend = detect_backend(peek_payload, peeked_payload);
-    fprintf(stderr, "[tunnel] Backend: %s:%d\n", backend->host, backend->port);
-
-    int server_sock = connect_backend(backend->host, backend->port);
+    /* Se não conectou ainda (modo normal) */
     if (server_sock < 0) {
-        fprintf(stderr, "[ERRO] Falha backend\n");
-        close(client_sock);
-        return;
+        char peek_temp[BUFFER_SIZE] = {0};
+        peek_data(client_sock, peek_temp, sizeof(peek_temp)-1);
+        backend = detect_backend(peek_temp, strlen(peek_temp));
+        server_sock = connect_backend(backend->host, backend->port);
+        if (server_sock < 0) {
+            close(client_sock);
+            return;
+        }
     }
 
-    /* Inicia túnel */
+    /* Tunelamento imediato */
     pthread_t t1, t2;
     int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
     int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
