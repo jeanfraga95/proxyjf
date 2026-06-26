@@ -297,9 +297,7 @@ static void handle_client(int client_sock) {
     char resp[256];
 
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
-    int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
-                     (strstr(buf, "proxyc: on") != NULL);
-
+    int has_proxyc = (strstr(buf, "proxyc:on") != NULL) || (strstr(buf, "proxyc: on") != NULL);
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi   = (verb_count > 1);
 
@@ -309,30 +307,25 @@ static void handle_client(int client_sock) {
     const char *status = get_random_status();
 
     if (has_proxyc) {
+        /* Modo proxyc */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
         recv(client_sock, buf, BUFFER_SIZE, 0);
     }
     else if (is_multi) {
-        fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
-
+        /* Multi-Status */
         for (int i = 0; i < verb_count; i++) {
             status = get_random_status();
             snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
             write(client_sock, resp, strlen(resp));
         }
 
+        /* Consumo mais seguro */
         char drain[16384];
-        int total = 0;
-        int max_loops = AGGRESSIVE_MODE ? 25 : 12;
-        for (int i = 0; i < max_loops; i++) {
-            ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
-            if (n <= 0) break;
-            total += n;
-            if (total > 450) break;
+        for (int i = 0; i < (AGGRESSIVE_MODE ? 20 : 10); i++) {
+            if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
         }
-        fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
         BackendRule *backend = &CONFIG.backends[1];
         int server_sock = connect_backend(backend->host, backend->port);
@@ -342,6 +335,7 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
+        /* Tunelamento */
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
         int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
@@ -356,13 +350,11 @@ static void handle_client(int client_sock) {
         return;
     }
     else {
-        /* Modo Normal */
+        /* Modo Normal - mantido fiel ao original */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
-        }
+        recv(client_sock, buf, BUFFER_SIZE, 0);   // igual ao original
 
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
