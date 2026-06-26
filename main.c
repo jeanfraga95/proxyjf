@@ -332,22 +332,47 @@ static void handle_client(int client_sock) {
         recv(client_sock, buf, BUFFER_SIZE, 0);
     }
     else if (is_multi) {
-        fprintf(stderr, "[multi] Respondendo %d vezes 101\n", verb_count);
+        fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         /* Responde 101 para cada verbo */
         for (int i = 0; i < verb_count; i++) {
             status = get_random_status();
             snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-            if (write(client_sock, resp, strlen(resp)) <= 0) {
-                close(client_sock); return;
+            write(client_sock, resp, strlen(resp));
+        }
+
+        /* === CONSUMO AGRESSIVO PARA MULTI-STATUS === */
+        fprintf(stderr, "[multi] Iniciando consumo agressivo de headers...\n");
+        
+        int total_consumed = 0;
+        char drain_buf[8192];
+        int attempts = 0;
+
+        while (attempts < 15) {  // máximo 15 tentativas
+            attempts++;
+            ssize_t n = recv(client_sock, drain_buf, sizeof(drain_buf), 0);
+            if (n <= 0) break;
+
+            total_consumed += n;
+            fprintf(stderr, "[multi] Consumido +%ld bytes (total: %d)\n", n, total_consumed);
+
+            /* Se encontrou dados binários (não HTTP), para de consumir */
+            if (n >= 4 && 
+                (drain_buf[0] < 32 || drain_buf[0] > 126 || 
+                 drain_buf[1] < 32 || drain_buf[1] > 126)) {
+                fprintf(stderr, "[multi] Detectado possível payload binário/real - parando consumo\n");
+                break;
+            }
+
+            /* Se ainda tem verbos HTTP, continua consumindo */
+            if (count_http_verbs(drain_buf, n) > 0) {
+                continue;
             }
         }
 
-        /* === CONSUME HEADERS COM MAIS CUIDADO === */
-        int consumed = consume_headers(client_sock);
-        fprintf(stderr, "[multi] Headers consumidos: %d bytes\n", consumed);
+        fprintf(stderr, "[multi] Consumo finalizado: %d bytes\n", total_consumed);
 
-        /* 200 final */
+        /* 200 OK final */
         status = get_random_status();
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
@@ -357,22 +382,23 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        consume_headers(client_sock);
+        consume_headers(client_sock);   // mantemos a função antiga para modo normal
 
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Pequeno delay para dar tempo do app enviar o payload real */
-    usleep(50000);  // 50ms
+    usleep(80000);  // 80ms - dá tempo do app enviar payload real
 
-    /* 2. Peek do payload REAL para detectar backend */
+    /* Peek final para detectar backend */
     char peek_payload[BUFFER_SIZE] = {0};
     int peeked_payload = peek_data(client_sock, peek_payload, sizeof(peek_payload) - 1);
 
     fprintf(stderr, "[backend detect] peeked_payload = %d bytes\n", peeked_payload);
-    if (peeked_payload > 0) {
-        fprintf(stderr, "[payload preview] %.100s...\n", peek_payload);
+    if (peeked_payload > 0 && peeked_payload < 150) {
+        fprintf(stderr, "[payload preview] %.120s\n", peek_payload);
+    } else if (peeked_payload > 0) {
+        fprintf(stderr, "[payload preview] Dados binários ou longos (%d bytes) - OK\n", peeked_payload);
     }
 
     BackendRule *backend = detect_backend(peek_payload, peeked_payload);
@@ -381,7 +407,7 @@ static void handle_client(int client_sock) {
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
-        fprintf(stderr, "[ERRO] Falha ao conectar no backend\n");
+        fprintf(stderr, "[ERRO] Falha ao conectar backend\n");
         close(client_sock);
         return;
     }
