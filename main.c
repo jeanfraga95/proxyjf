@@ -13,7 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "1.8-DEBUG"
+#define VERSION "1.9-TUNNEL-DEBUG"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -178,12 +178,11 @@ static void *transfer(void *arg) {
     int *fds = (int *)arg;
     char buf[BUFFER_SIZE];
     ssize_t bytes;
-    fprintf(stderr, "[transfer] Iniciando túnel %d <-> %d\n", fds[0], fds[1]);
+    fprintf(stderr, "[transfer] Túnel %d <-> %d INICIADO\n", fds[0], fds[1]);
     while ((bytes = read(fds[0], buf, BUFFER_SIZE)) > 0) {
-        ssize_t sent = write(fds[1], buf, bytes);
-        if (sent <= 0) break;
+        if (write(fds[1], buf, bytes) <= 0) break;
     }
-    fprintf(stderr, "[transfer] Túnel finalizado\n");
+    fprintf(stderr, "[transfer] Túnel %d <-> %d FINALIZADO\n", fds[0], fds[1]);
     shutdown(fds[1], SHUT_WR);
     shutdown(fds[0], SHUT_RD);
     free(fds);
@@ -246,7 +245,7 @@ static int connect_backend(const char *host, int port) {
     }
 
     fcntl(sock, F_SETFL, flags);
-    fprintf(stderr, "[backend] Conectado em %s:%d\n", host, port);
+    fprintf(stderr, "[backend] Conectado com sucesso em %s:%d\n", host, port);
     return sock;
 }
 
