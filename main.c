@@ -13,7 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "2.5-GOLANG-MATCH"
+#define VERSION "2.6-101-FIX"
 
 #define BUFFER_SIZE 1048576
 
@@ -48,26 +48,17 @@ static int connect_backend() {
 
 static void handle_client(int client) {
     char buf[BUFFER_SIZE];
-    int n;
 
-    // Peek inicial
-    n = recv(client, buf, sizeof(buf)-1, MSG_PEEK);
-    if (n > 0) buf[n] = 0;
+    // Peek rápido
+    recv(client, buf, sizeof(buf)-1, MSG_PEEK);
 
-    fprintf(stderr, "[v%s] verbos=%d\n", VERSION, 
-            (strstr(buf, "GET") || strstr(buf, "POST") || strstr(buf, "CONNECT")) ? 1 : 0);
+    fprintf(stderr, "[v%s] verbos=1\n", VERSION);
 
-    // Handshake 101
+    // Apenas 101 (como o Golang faz em muitos casos)
     write(client, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
 
-    // Drain agressivo (como o Golang faz)
-    for (int i = 0; i < 20; i++) {
-        n = recv(client, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-    }
-
-    // 200 OK
-    write(client, "HTTP/1.1 200 OK\r\n\r\n", 19);
+    // Drain mínimo
+    recv(client, buf, sizeof(buf), 0);
 
     int backend = connect_backend();
     if (backend < 0) {
@@ -76,8 +67,8 @@ static void handle_client(int client) {
     }
 
     pthread_t t1, t2;
-    int *c2s = malloc(2*sizeof(int)); c2s[0]=client; c2s[1]=backend;
-    int *s2c = malloc(2*sizeof(int)); s2c[0]=backend; s2c[1]=client;
+    int *c2s = malloc(2*sizeof(int)); c2s[0] = client; c2s[1] = backend;
+    int *s2c = malloc(2*sizeof(int)); s2c[0] = backend; s2c[1] = client;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
@@ -92,7 +83,7 @@ int main() {
     printf("ProxyC v%s iniciando...\n", VERSION);
 
     int s = socket(AF_INET6, SOCK_STREAM, 0);
-    int opt=1;
+    int opt = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in6 addr = {0};
