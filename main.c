@@ -13,7 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "2.2-AGGRESSIVE"
+#define VERSION "2.3-FINAL-ATTEMPT"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -70,7 +70,7 @@ static int connect_backend() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Agressiva                                     */
+/* Handle Client - Versão Final                                         */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
@@ -84,21 +84,19 @@ static void handle_client(int client_sock) {
 
     fprintf(stderr, "[v%s] verbos=%d\n", VERSION, verb_count);
 
-    // Respostas 101 + 200
+    // Respostas
     if (verb_count > 1) {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
-        write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
     } else {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
-        write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
     }
 
-    // Consome tudo agressivamente
-    char drain[BUFFER_SIZE];
-    for (int i = 0; i < 10; i++) {
-        if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
-    }
+    // Consome tudo
+    recv(client_sock, buf, sizeof(buf), 0);
+
+    // 200 OK
+    write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
 
     // Túnel
     int server_sock = connect_backend();
