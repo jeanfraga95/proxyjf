@@ -13,7 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "2.0-FINAL"
+#define VERSION "2.1-MATCH-WORKING"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -70,13 +70,13 @@ static int connect_backend() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Final                                         */
+/* Handle Client - Versão Match Working                                 */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256] = {0};
 
-    // Peek
+    // Peek inicial
     recv(client_sock, buf, sizeof(buf)-1, MSG_PEEK);
 
     int verb_count = 0;
@@ -84,18 +84,16 @@ static void handle_client(int client_sock) {
 
     fprintf(stderr, "[v%s] verbos=%d\n", VERSION, verb_count);
 
+    // Multi-status
     if (verb_count > 1) {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
+        write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
     } else {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
+        recv(client_sock, buf, sizeof(buf), 0);
+        write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
     }
-
-    // Consome request
-    recv(client_sock, buf, sizeof(buf), 0);
-
-    // 200 OK
-    write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
 
     // Túnel
     int server_sock = connect_backend();
