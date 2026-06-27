@@ -17,7 +17,7 @@
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
 #define BUFFER_SIZE      255369
-#define PEEK_TIMEOUT     8
+#define PEEK_TIMEOUT     10
 #define CONNECT_TIMEOUT  15
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
@@ -55,10 +55,7 @@ static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* Configuração                                                         */
 /* ------------------------------------------------------------------ */
 static void free_config(ProxyConfig *cfg) {
-    for (int i = 0; i < cfg->status_count; i++) {
-        free(cfg->statuses[i]);
-        cfg->statuses[i] = NULL;
-    }
+    for (int i = 0; i < cfg->status_count; i++) free(cfg->statuses[i]);
     cfg->status_count = cfg->backend_count = 0;
 }
 
@@ -68,11 +65,9 @@ static void parse_args(int argc, char *argv[]) {
     char *new_def_status = "Switching Protocols";
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            new_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
-            new_def_status = argv[++i];
-        } else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) new_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) new_def_status = argv[++i];
+        else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
             char *copy = strdup(argv[++i]);
             char *token = strtok(copy, ",");
             while (token && new_cfg.status_count < MAX_STATUS) {
@@ -122,15 +117,8 @@ static void parse_args(int argc, char *argv[]) {
 /* ------------------------------------------------------------------ */
 /* Handlers de sinal                                                    */
 /* ------------------------------------------------------------------ */
-static void handle_sighup(int sig) {
-    (void)sig;
-    reload_flag = 1;
-}
-
-static void handle_sigchld(int sig) {
-    (void)sig;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-}
+static void handle_sighup(int sig) { (void)sig; reload_flag = 1; }
+static void handle_sigchld(int sig) { (void)sig; while (waitpid(-1, NULL, WNOHANG) > 0); }
 
 /* ------------------------------------------------------------------ */
 /* Utilitários                                                          */
@@ -271,21 +259,18 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Otimizada para CloudFront                     */
+/* Handle Client - Versão Estável                                       */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256];
 
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
-    int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
-                     (strstr(buf, "proxyc: on") != NULL);
-
+    int has_proxyc = (strstr(buf, "proxyc:on") != NULL) || (strstr(buf, "proxyc: on") != NULL);
     int verb_count = count_http_verbs(buf, peeked);
-    int is_multi   = (verb_count > 1);
+    int is_multi = (verb_count > 1);
 
-    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d | peeked=%d\n", 
-            verb_count, is_multi, has_proxyc, peeked);
+    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d peeked=%d\n", verb_count, is_multi, has_proxyc, peeked);
 
     const char *status = get_random_status();
 
@@ -294,8 +279,7 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
         recv(client_sock, buf, BUFFER_SIZE, 0);
-    }
-    else if (is_multi) {
+    } else if (is_multi) {
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -304,16 +288,17 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo mais tolerante para CloudFront */
+        /* Consumo simples e seguro */
         char drain[16384];
-        for (int i = 0; i < 15; i++) {
+        for (int i = 0; i < 10; i++) {
             if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
         }
 
         BackendRule *backend = &CONFIG.backends[1];
         int server_sock = connect_backend(backend->host, backend->port);
         if (server_sock < 0) {
-            close(client_sock); return;
+            close(client_sock);
+            return;
         }
 
         status = get_random_status();
@@ -332,15 +317,12 @@ static void handle_client(int client_sock) {
         close(client_sock);
         close(server_sock);
         return;
-    }
-    else {
+    } else {
         /* Modo Normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
-        }
+        recv(client_sock, buf, BUFFER_SIZE, 0);
 
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
@@ -348,12 +330,13 @@ static void handle_client(int client_sock) {
 
     /* Tunelamento */
     char peek[BUFFER_SIZE] = {0};
-    int peeked_final = peek_data(client_sock, peek, sizeof(peek) - 1);
-    BackendRule *backend = detect_backend(peek, peeked_final);
+    peek_data(client_sock, peek, sizeof(peek) - 1);
+    BackendRule *backend = detect_backend(peek, strlen(peek));
 
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) {
-        close(client_sock); return;
+        close(client_sock);
+        return;
     }
 
     pthread_t t1, t2;
