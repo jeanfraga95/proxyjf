@@ -115,7 +115,7 @@ static void parse_args(int argc, char *argv[]) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handlers de sinal                                                    */
+/* Handlers                                                            */
 /* ------------------------------------------------------------------ */
 static void handle_sighup(int sig) { (void)sig; reload_flag = 1; }
 static void handle_sigchld(int sig) { (void)sig; while (waitpid(-1, NULL, WNOHANG) > 0); }
@@ -259,11 +259,11 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Estável                                       */
+/* Handle Client - Versão Segura                                        */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
-    char resp[256];
+    char resp[256] = {0};
 
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
     int has_proxyc = (strstr(buf, "proxyc:on") != NULL) || (strstr(buf, "proxyc: on") != NULL);
@@ -288,9 +288,9 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo simples e seguro */
+        /* Consumo seguro */
         char drain[16384];
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 8; i++) {
             if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
         }
 
@@ -306,8 +306,15 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
 
         pthread_t t1, t2;
-        int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
-        int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
+        int *c2s = malloc(2 * sizeof(int));
+        int *s2c = malloc(2 * sizeof(int));
+        if (!c2s || !s2c) {
+            close(client_sock);
+            close(server_sock);
+            return;
+        }
+        c2s[0] = client_sock; c2s[1] = server_sock;
+        s2c[0] = server_sock; s2c[1] = client_sock;
 
         pthread_create(&t1, NULL, transfer, c2s);
         pthread_create(&t2, NULL, transfer, s2c);
@@ -340,8 +347,15 @@ static void handle_client(int client_sock) {
     }
 
     pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
-    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
+    int *c2s = malloc(2 * sizeof(int));
+    int *s2c = malloc(2 * sizeof(int));
+    if (!c2s || !s2c) {
+        close(client_sock);
+        close(server_sock);
+        return;
+    }
+    c2s[0] = client_sock; c2s[1] = server_sock;
+    s2c[0] = server_sock; s2c[1] = client_sock;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
