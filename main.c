@@ -9,25 +9,27 @@
 #include <errno.h>
 #include <fcntl.h>
 
-#define VERSION "2.8-TUNNEL-STABLE"
-#define BUFFER_SIZE 2097152  // 2MB como o Go
+#define VERSION "2.9-FINAL-FIX"
+#define BUFFER_SIZE 1048576
 
 static void *transfer(void *arg) {
-    int *fds = (int*)arg;
+    int from = ((int*)arg)[0];
+    int to   = ((int*)arg)[1];
+    free(arg);
+
     char buf[BUFFER_SIZE];
     ssize_t n;
-    fprintf(stderr, "[transfer] Túnel %d <-> %d INICIADO\n", fds[0], fds[1]);
+    fprintf(stderr, "[transfer] Túnel %d <-> %d INICIADO\n", from, to);
 
     while (1) {
-        n = read(fds[0], buf, BUFFER_SIZE);
+        n = read(from, buf, BUFFER_SIZE);
         if (n <= 0) break;
-        if (write(fds[1], buf, n) <= 0) break;
+        if (write(to, buf, n) <= 0) break;
     }
 
-    fprintf(stderr, "[transfer] Túnel %d <-> %d FINALIZADO\n", fds[0], fds[1]);
-    shutdown(fds[0], SHUT_RDWR);
-    shutdown(fds[1], SHUT_RDWR);
-    free(fds);
+    fprintf(stderr, "[transfer] Túnel %d <-> %d FINALIZADO\n", from, to);
+    shutdown(from, SHUT_RDWR);
+    shutdown(to, SHUT_RDWR);
     return NULL;
 }
 
@@ -40,8 +42,7 @@ static int connect_backend() {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
-    // Timeout maior
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    struct timeval tv = {15, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -55,17 +56,15 @@ static int connect_backend() {
 
 static void handle_client(int client) {
     char buf[BUFFER_SIZE];
-    ssize_t n;
 
     fprintf(stderr, "[v%s] Novo cliente\n", VERSION);
 
-    // Handshake mínimo + drain leve
+    // Handshake
     write(client, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
 
-    // Drain controlado (não muito agressivo)
-    for (int i = 0; i < 8; i++) {
-        n = recv(client, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+    // Drain leve
+    for (int i = 0; i < 5; i++) {
+        if (recv(client, buf, sizeof(buf), 0) <= 0) break;
     }
 
     write(client, "HTTP/1.1 200 OK\r\n\r\n", 19);
@@ -76,18 +75,18 @@ static void handle_client(int client) {
         return;
     }
 
+    // Threads sem join (fire and forget)
     pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client;  c2s[1] = backend;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client; c2s[1] = backend;
     int *s2c = malloc(2 * sizeof(int)); s2c[0] = backend; s2c[1] = client;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
 
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
+    pthread_detach(t1);
+    pthread_detach(t2);
 
-    close(client);
-    close(backend);
+    // Não fecha sockets aqui (threads cuidam)
 }
 
 int main() {
