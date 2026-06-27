@@ -13,14 +13,14 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "1.6-ANTI-CRASH"
+#define VERSION "1.7-STABLE"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      131072
-#define PEEK_TIMEOUT     8
-#define CONNECT_TIMEOUT  12
+#define BUFFER_SIZE      262144
+#define PEEK_TIMEOUT     12
+#define CONNECT_TIMEOUT  20
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
 
@@ -253,7 +253,7 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Segura v1.6                                   */
+/* Handle Client - Versão Segura v1.7                                   */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
@@ -310,6 +310,9 @@ static void handle_client(int client_sock) {
             pthread_create(&t2, NULL, transfer, s2c);
             pthread_join(t1, NULL);
             pthread_join(t2, NULL);
+        } else {
+            free(c2s);
+            free(s2c);
         }
 
         close(client_sock);
@@ -325,7 +328,6 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Tunelamento */
     char peek[BUFFER_SIZE] = {0};
     peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, strlen(peek));
@@ -347,6 +349,9 @@ static void handle_client(int client_sock) {
         pthread_create(&t2, NULL, transfer, s2c);
         pthread_join(t1, NULL);
         pthread_join(t2, NULL);
+    } else {
+        free(c2s);
+        free(s2c);
     }
 
     close(client_sock);
