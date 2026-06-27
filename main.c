@@ -13,12 +13,12 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "2.3-FINAL-ATTEMPT"
+#define VERSION "2.4-AGGRESSIVE-FINAL"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      524288
+#define BUFFER_SIZE      1048576  // 1MB
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                              */
@@ -70,7 +70,7 @@ static int connect_backend() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Final                                         */
+/* Handle Client - Versão Final Agressiva                               */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
@@ -84,7 +84,7 @@ static void handle_client(int client_sock) {
 
     fprintf(stderr, "[v%s] verbos=%d\n", VERSION, verb_count);
 
-    // Respostas
+    // Respostas 101
     if (verb_count > 1) {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
@@ -92,8 +92,11 @@ static void handle_client(int client_sock) {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
     }
 
-    // Consome tudo
-    recv(client_sock, buf, sizeof(buf), 0);
+    // Consome agressivamente
+    char drain[BUFFER_SIZE];
+    for (int i = 0; i < 15; i++) {
+        if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
+    }
 
     // 200 OK
     write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
