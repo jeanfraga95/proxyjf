@@ -13,7 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "2.1-MATCH-WORKING"
+#define VERSION "2.2-AGGRESSIVE"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -32,7 +32,7 @@ static void handle_sighup(int sig) { (void)sig; }
 static void handle_sigchld(int sig) { (void)sig; while (waitpid(-1, NULL, WNOHANG) > 0); }
 
 /* ------------------------------------------------------------------ */
-/* Transfer Function                                                    */
+/* Transfer                                                             */
 /* ------------------------------------------------------------------ */
 static void *transfer(void *arg) {
     int *fds = (int *)arg;
@@ -70,13 +70,13 @@ static int connect_backend() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Match Working                                 */
+/* Handle Client - Versão Agressiva                                     */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256] = {0};
 
-    // Peek inicial
+    // Peek
     recv(client_sock, buf, sizeof(buf)-1, MSG_PEEK);
 
     int verb_count = 0;
@@ -84,15 +84,20 @@ static void handle_client(int client_sock) {
 
     fprintf(stderr, "[v%s] verbos=%d\n", VERSION, verb_count);
 
-    // Multi-status
+    // Respostas 101 + 200
     if (verb_count > 1) {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
         write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
     } else {
         write(client_sock, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
-        recv(client_sock, buf, sizeof(buf), 0);
         write(client_sock, "HTTP/1.1 200 OK\r\n\r\n", 19);
+    }
+
+    // Consome tudo agressivamente
+    char drain[BUFFER_SIZE];
+    for (int i = 0; i < 10; i++) {
+        if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
     }
 
     // Túnel
