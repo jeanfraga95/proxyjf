@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <sys/wait.h>
 
+#define VERSION "1.5-STABLE"
+
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
@@ -115,7 +117,7 @@ static void parse_args(int argc, char *argv[]) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handlers                                                            */
+/* Handlers                                                             */
 /* ------------------------------------------------------------------ */
 static void handle_sighup(int sig) { (void)sig; reload_flag = 1; }
 static void handle_sigchld(int sig) { (void)sig; while (waitpid(-1, NULL, WNOHANG) > 0); }
@@ -259,7 +261,7 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Segura                                        */
+/* Handle Client - Versão Segura v1.5                                   */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
@@ -270,7 +272,8 @@ static void handle_client(int client_sock) {
     int verb_count = count_http_verbs(buf, peeked);
     int is_multi = (verb_count > 1);
 
-    fprintf(stderr, "[client] verbos=%d multi=%d proxyc=%d peeked=%d\n", verb_count, is_multi, has_proxyc, peeked);
+    fprintf(stderr, "[v%s] client verbos=%d multi=%d proxyc=%d peeked=%d\n", 
+            VERSION, verb_count, is_multi, has_proxyc, peeked);
 
     const char *status = get_random_status();
 
@@ -288,7 +291,6 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consumo seguro */
         char drain[16384];
         for (int i = 0; i < 8; i++) {
             if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
@@ -325,7 +327,6 @@ static void handle_client(int client_sock) {
         close(server_sock);
         return;
     } else {
-        /* Modo Normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
@@ -335,7 +336,6 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Tunelamento */
     char peek[BUFFER_SIZE] = {0};
     peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, strlen(peek));
@@ -377,7 +377,7 @@ static void accept_loop(int server_sock) {
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
-            printf("[SIGHUP] Configuração recarregada\n");
+            printf("[SIGHUP] Configuração recarregada (v%s)\n", VERSION);
         }
 
         int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -405,6 +405,8 @@ static void accept_loop(int server_sock) {
 int main(int argc, char *argv[]) {
     srand(time(NULL));
     signal(SIGPIPE, SIG_IGN);
+
+    printf("ProxyC v%s iniciando...\n", VERSION);
 
     saved_argc = argc;
     saved_argv = argv;
@@ -440,8 +442,8 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("ProxyC rodando na porta %d | Multi-status: %d | Backends: %d\n",
-           PORT, CONFIG.status_count, CONFIG.backend_count);
+    printf("ProxyC v%s rodando na porta %d | Multi-status: %d | Backends: %d\n",
+           VERSION, PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
 
     accept_loop(server_sock);
