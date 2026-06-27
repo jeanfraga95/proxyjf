@@ -13,12 +13,12 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "1.9-MINIMAL"
+#define VERSION "2.0-FINAL"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      262144
+#define BUFFER_SIZE      524288
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                              */
@@ -70,7 +70,7 @@ static int connect_backend() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Minimal                                       */
+/* Handle Client - Versão Final                                         */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
