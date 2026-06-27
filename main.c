@@ -13,14 +13,14 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define VERSION "1.5-STABLE"
+#define VERSION "1.6-ANTI-CRASH"
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      255369
-#define PEEK_TIMEOUT     10
-#define CONNECT_TIMEOUT  15
+#define BUFFER_SIZE      131072
+#define PEEK_TIMEOUT     8
+#define CONNECT_TIMEOUT  12
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
 
@@ -69,15 +69,7 @@ static void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) new_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) new_def_status = argv[++i];
-        else if (strcmp(argv[i], "--status-list") == 0 && i + 1 < argc) {
-            char *copy = strdup(argv[++i]);
-            char *token = strtok(copy, ",");
-            while (token && new_cfg.status_count < MAX_STATUS) {
-                new_cfg.statuses[new_cfg.status_count++] = strdup(token);
-                token = strtok(NULL, ",");
-            }
-            free(copy);
-        } else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
+        else if (strcmp(argv[i], "--upgrade") == 0 && i + 1 < argc) {
             char *copy = strdup(argv[++i]);
             char *rule = strtok(copy, ",");
             while (rule && new_cfg.backend_count < MAX_BACKEND) {
@@ -261,7 +253,7 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Versão Segura v1.5                                   */
+/* Handle Client - Versão Segura v1.6                                   */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
@@ -291,8 +283,8 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        char drain[16384];
-        for (int i = 0; i < 8; i++) {
+        char drain[8192];
+        for (int i = 0; i < 6; i++) {
             if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
         }
 
@@ -310,18 +302,15 @@ static void handle_client(int client_sock) {
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int));
         int *s2c = malloc(2 * sizeof(int));
-        if (!c2s || !s2c) {
-            close(client_sock);
-            close(server_sock);
-            return;
-        }
-        c2s[0] = client_sock; c2s[1] = server_sock;
-        s2c[0] = server_sock; s2c[1] = client_sock;
+        if (c2s && s2c) {
+            c2s[0] = client_sock; c2s[1] = server_sock;
+            s2c[0] = server_sock; s2c[1] = client_sock;
 
-        pthread_create(&t1, NULL, transfer, c2s);
-        pthread_create(&t2, NULL, transfer, s2c);
-        pthread_join(t1, NULL);
-        pthread_join(t2, NULL);
+            pthread_create(&t1, NULL, transfer, c2s);
+            pthread_create(&t2, NULL, transfer, s2c);
+            pthread_join(t1, NULL);
+            pthread_join(t2, NULL);
+        }
 
         close(client_sock);
         close(server_sock);
@@ -336,6 +325,7 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
+    /* Tunelamento */
     char peek[BUFFER_SIZE] = {0};
     peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, strlen(peek));
@@ -349,18 +339,15 @@ static void handle_client(int client_sock) {
     pthread_t t1, t2;
     int *c2s = malloc(2 * sizeof(int));
     int *s2c = malloc(2 * sizeof(int));
-    if (!c2s || !s2c) {
-        close(client_sock);
-        close(server_sock);
-        return;
-    }
-    c2s[0] = client_sock; c2s[1] = server_sock;
-    s2c[0] = server_sock; s2c[1] = client_sock;
+    if (c2s && s2c) {
+        c2s[0] = client_sock; c2s[1] = server_sock;
+        s2c[0] = server_sock; s2c[1] = client_sock;
 
-    pthread_create(&t1, NULL, transfer, c2s);
-    pthread_create(&t2, NULL, transfer, s2c);
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
+        pthread_create(&t1, NULL, transfer, c2s);
+        pthread_create(&t2, NULL, transfer, s2c);
+        pthread_join(t1, NULL);
+        pthread_join(t2, NULL);
+    }
 
     close(client_sock);
     close(server_sock);
