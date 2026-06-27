@@ -8,13 +8,8 @@
 #include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/time.h>
-#include <time.h>
-#include <signal.h>
-#include <sys/wait.h>
 
-#define VERSION "2.6-101-FIX"
-
+#define VERSION "2.7-AGGRESSIVE-GO-MATCH"
 #define BUFFER_SIZE 1048576
 
 static void *transfer(void *arg) {
@@ -26,7 +21,8 @@ static void *transfer(void *arg) {
         if (write(fds[1], buf, n) <= 0) break;
     }
     fprintf(stderr, "[transfer] Túnel %d <-> %d FINALIZADO\n", fds[0], fds[1]);
-    shutdown(fds[1], SHUT_WR);
+    shutdown(fds[0], SHUT_RDWR);
+    shutdown(fds[1], SHUT_RDWR);
     free(fds);
     return NULL;
 }
@@ -35,30 +31,39 @@ static int connect_backend() {
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(22);
-    inet_pton(AF_INET, "0.0.0.0", &addr.sin_addr);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0 || connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (sock < 0) return -1;
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(sock);
         return -1;
     }
-    fprintf(stderr, "[backend] Conectado em 0.0.0.0:22\n");
+    fprintf(stderr, "[backend] Conectado em 127.0.0.1:22\n");
     return sock;
 }
 
 static void handle_client(int client) {
     char buf[BUFFER_SIZE];
+    ssize_t n;
 
-    // Peek rápido
-    recv(client, buf, sizeof(buf)-1, MSG_PEEK);
+    // Peek agressivo
+    n = recv(client, buf, sizeof(buf)-1, MSG_PEEK);
+    if (n > 0) buf[n] = '\0';
 
-    fprintf(stderr, "[v%s] verbos=1\n", VERSION);
+    fprintf(stderr, "[v%s] verbos=1 (client peek %zd bytes)\n", VERSION, n);
 
-    // Apenas 101 (como o Golang faz em muitos casos)
+    // Handshake idêntico ao Go (101 + drain + 200)
     write(client, "HTTP/1.1 101 Switching Protocols\r\n\r\n", 38);
 
-    // Drain mínimo
-    recv(client, buf, sizeof(buf), 0);
+    // Drain muito agressivo (como o Go faz)
+    for (int i = 0; i < 30; i++) {
+        n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        fprintf(stderr, "[drain] Consumidos %zd bytes\n", n);
+    }
+
+    write(client, "HTTP/1.1 200 OK\r\n\r\n", 19);
 
     int backend = connect_backend();
     if (backend < 0) {
@@ -67,11 +72,12 @@ static void handle_client(int client) {
     }
 
     pthread_t t1, t2;
-    int *c2s = malloc(2*sizeof(int)); c2s[0] = client; c2s[1] = backend;
-    int *s2c = malloc(2*sizeof(int)); s2c[0] = backend; s2c[1] = client;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client; c2s[1] = backend;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = backend; s2c[1] = client;
 
     pthread_create(&t1, NULL, transfer, c2s);
     pthread_create(&t2, NULL, transfer, s2c);
+
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
 
@@ -92,7 +98,7 @@ int main() {
     addr.sin6_addr = in6addr_any;
 
     bind(s, (struct sockaddr*)&addr, sizeof(addr));
-    listen(s, 512);
+    listen(s, 1024);
 
     printf("ProxyC v%s rodando na porta 80\n", VERSION);
 
