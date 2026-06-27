@@ -17,8 +17,8 @@
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
 #define BUFFER_SIZE      255369
-#define PEEK_TIMEOUT     5
-#define CONNECT_TIMEOUT  10
+#define PEEK_TIMEOUT     8
+#define CONNECT_TIMEOUT  15
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
 
@@ -144,26 +144,12 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
-static int consume_headers(int sock) {
-    char buffer[BUFFER_SIZE] = {0};
-    int total = 0;
-    while (1) {
-        ssize_t n = recv(sock, buffer + total, sizeof(buffer) - total - 1, 0);
-        if (n <= 0) break;
-        total += n;
-        buffer[total] = '\0';
-        if (strstr(buffer, "\r\n\r\n") || strstr(buffer, "\n\n")) break;
-        if (total > BUFFER_SIZE - 4096) break;
-    }
-    return total;
-}
-
 static int count_http_verbs(const char *buf, int len) {
     if (len <= 0) return 0;
     static const char *VERBS[] = {
-        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ",
-        "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ", "SUBSCRIBE ",
-        NULL
+        "GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ", "PUT ", "DELETE ",
+        "PATCH ", "TRACE ", "ACL ", "CHECKIN ", "UNLOCK ", "PROPFIND ",
+        "PROPPATCH ", "SUBSCRIBE ", "NOTIFY ", NULL
     };
     int count = 0;
     const char *p = buf;
@@ -285,15 +271,13 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handle Client - Multi-Status + Modo Normal Original Preservado      */
+/* Handle Client - Versão Otimizada para CloudFront                     */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buf[BUFFER_SIZE] = {0};
     char resp[256];
 
-    /* Peek inicial */
     int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
-
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
@@ -312,7 +296,6 @@ static void handle_client(int client_sock) {
         recv(client_sock, buf, BUFFER_SIZE, 0);
     }
     else if (is_multi) {
-        /* ====================== MULTI-STATUS ====================== */
         fprintf(stderr, "[multi] Respondendo %d× 101\n", verb_count);
 
         for (int i = 0; i < verb_count; i++) {
@@ -321,18 +304,12 @@ static void handle_client(int client_sock) {
             write(client_sock, resp, strlen(resp));
         }
 
-        /* Consome handshake */
+        /* Consumo mais tolerante para CloudFront */
         char drain[16384];
-        int total = 0;
-        for (int i = 0; i < 12; i++) {
-            ssize_t n = recv(client_sock, drain, sizeof(drain), 0);
-            if (n <= 0) break;
-            total += n;
-            if (total > 350) break;
+        for (int i = 0; i < 15; i++) {
+            if (recv(client_sock, drain, sizeof(drain), 0) <= 0) break;
         }
-        fprintf(stderr, "[multi] Handshake consumido: %d bytes\n", total);
 
-        /* Força SSH no multi-status */
         BackendRule *backend = &CONFIG.backends[1];
         int server_sock = connect_backend(backend->host, backend->port);
         if (server_sock < 0) {
@@ -343,7 +320,6 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
-        /* Tunelamento */
         pthread_t t1, t2;
         int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
         int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
@@ -358,7 +334,7 @@ static void handle_client(int client_sock) {
         return;
     }
     else {
-        /* ====================== MODO NORMAL (igual ao original) ====================== */
+        /* Modo Normal */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
 
@@ -370,7 +346,7 @@ static void handle_client(int client_sock) {
         write(client_sock, resp, strlen(resp));
     }
 
-    /* Peek para detectar backend (usado tanto no normal quanto no proxyc) */
+    /* Tunelamento */
     char peek[BUFFER_SIZE] = {0};
     int peeked_final = peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, peeked_final);
@@ -394,7 +370,7 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Accept Loop & Main (mantido igual ao original)                       */
+/* Accept Loop & Main                                                   */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
@@ -404,8 +380,7 @@ static void accept_loop(int server_sock) {
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
-            printf("[SIGHUP] Configuração recarregada | Multi-status: %d | Backends: %d\n",
-                   CONFIG.status_count, CONFIG.backend_count);
+            printf("[SIGHUP] Configuração recarregada\n");
         }
 
         int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -468,8 +443,7 @@ int main(int argc, char *argv[]) {
         perror("listen"); return 1;
     }
 
-    printf("ProxyC rodando na porta %d (IPv4 + IPv6) | "
-           "Multi-status: %d | Backends: %d\n",
+    printf("ProxyC rodando na porta %d | Multi-status: %d | Backends: %d\n",
            PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
 
