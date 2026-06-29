@@ -297,13 +297,22 @@ static int connect_backend(const char *host, int port) {
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
-    char        resp[256];
+    char        resp[512];
     const char *status = get_random_status();
 
     /* Peek do request para detectar o header especial */
     peek_data(client_sock, buf, sizeof(buf) - 1);
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
+    
+    /* Detecta se é WebSocket ou CloudFront */
+    int is_websocket = (strstr(buf, "Upgrade: websocket") != NULL) ||
+                       (strstr(buf, "upgrade: websocket") != NULL) ||
+                       (strstr(buf, "Upgrade: WebSocket") != NULL);
+    
+    int is_cloudfront = (strstr(buf, "User-Agent: Amazon CloudFront") != NULL) ||
+                        (strstr(buf, "X-Amz-Cf-Id:") != NULL) ||
+                        (strstr(buf, "CloudFront-") != NULL);
 
     if (has_proxyc) {
         /* Modo proxyc:on → duplo 200 */
@@ -313,6 +322,65 @@ static void handle_client(int client_sock) {
         /* Consome o request da fila */
         if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
             close(client_sock); return;
+        }
+    } else if (is_websocket || is_cloudfront) {
+        /* Modo WebSocket/CloudFront → 101 Switching Protocols com headers completos */
+        char ws_resp[512];
+        
+        /* Extrai o Sec-WebSocket-Key se presente */
+        char *key_start = strstr(buf, "Sec-WebSocket-Key:");
+        char ws_key[256] = {0};
+        if (key_start) {
+            key_start += 18; // pula "Sec-WebSocket-Key:"
+            while (*key_start == ' ') key_start++;
+            sscanf(key_start, "%255[^\r\n]", ws_key);
+        }
+        
+        /* Resposta completa de upgrade WebSocket */
+        snprintf(ws_resp, sizeof(ws_resp),
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "%s%s%s"
+            "\r\n",
+            status,
+            ws_key[0] ? "Sec-WebSocket-Accept: " : "",
+            ws_key[0] ? generate_websocket_accept(ws_key) : ""
+        );
+        
+        write(client_sock, ws_resp, strlen(ws_resp));
+        
+        /* Se for CloudFront, redireciona imediatamente */
+        if (is_cloudfront) {
+            /* Consome o request atual */
+            if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+                close(client_sock); return;
+            }
+            
+            /* Redireciona para o backend CloudFront */
+            BackendRule *backend = get_cloudfront_backend();
+            if (backend) {
+                int server_sock = connect_backend(backend->host, backend->port);
+                if (server_sock >= 0) {
+                    /* Pipeline mode: já conecta e faz bridge */
+                    pthread_t t1, t2;
+                    int *c2s = malloc(2 * sizeof(int)); 
+                    c2s[0] = client_sock; c2s[1] = server_sock;
+                    int *s2c = malloc(2 * sizeof(int)); 
+                    s2c[0] = server_sock; s2c[1] = client_sock;
+
+                    pthread_create(&t1, NULL, transfer, c2s);
+                    pthread_create(&t2, NULL, transfer, s2c);
+                    pthread_join(t1, NULL);
+                    pthread_join(t2, NULL);
+
+                    close(server_sock);
+                    close(client_sock);
+                    return;
+                }
+            }
+            close(client_sock);
+            return;
         }
     } else {
         /* Modo padrão → 101 → consome request → 200 */
@@ -347,6 +415,29 @@ static void handle_client(int client_sock) {
     close(server_sock);
 }
 
+/* Função auxiliar para gerar o WebSocket Accept key */
+static char* generate_websocket_accept(const char *key) {
+    static char accept[64];
+    const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char combined[512];
+    
+    snprintf(combined, sizeof(combined), "%s%s", key, magic);
+    
+    unsigned char sha1[20];
+    SHA1((unsigned char*)combined, strlen(combined), sha1);
+    
+    base64_encode(sha1, 20, accept);
+    return accept;
+}
+
+/* Função para obter backend específico do CloudFront */
+static BackendRule* get_cloudfront_backend(void) {
+    static BackendRule cf_backend = {
+        .host = "your-cloudfront-endpoint.cloudfront.net",
+        .port = 443  // ou 80 para HTTP
+    };
+    return &cf_backend;
+}
 /* ------------------------------------------------------------------ */
 /* MELHORIA 4 — accept_loop sem thread wrapper (chamado direto do main) */
 /* MELHORIA 3 — verifica reload_flag antes de cada accept()            */
