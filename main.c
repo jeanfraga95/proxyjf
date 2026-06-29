@@ -12,7 +12,7 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <stdint.h>   /* para SHA1 */
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -53,15 +53,15 @@ static char                 **saved_argv   = NULL;
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
-/* Protótipos – declaração antes do uso                                */
+/* Protótipos                                                           */
 /* ------------------------------------------------------------------ */
 static void         handle_client(int client_sock);
 static const char  *generate_websocket_accept(const char *key);
-static BackendRule *get_cloudfront_backend(void);
-
-/* Implementações das funções que estavam implícitas */
-static void base64_encode(const unsigned char *data, size_t len, char *out);
-static void SHA1(const unsigned char *input, size_t len, unsigned char output[20]);
+static void         base64_encode(const unsigned char *data, size_t len, char *out);
+static void         SHA1(const unsigned char *input, size_t len, unsigned char output[20]);
+static BackendRule *detect_backend(const char *data, int len);
+static int          connect_backend(const char *host, int port);
+static void        *transfer(void *arg);
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -274,35 +274,30 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Função handle_client – agora com protótipos já declarados           */
+/* Função principal de tratamento do cliente                            */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
-    char        resp[512];
+    char        resp[1024];
     const char *status = get_random_status();
 
+    /* Peek inicial para detectar o header especial */
     peek_data(client_sock, buf, sizeof(buf) - 1);
 
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
 
-    int is_websocket = (strstr(buf, "Upgrade: websocket") != NULL) ||
-                       (strstr(buf, "upgrade: websocket") != NULL) ||
-                       (strstr(buf, "Upgrade: WebSocket") != NULL);
-
-    int is_cloudfront = (strstr(buf, "User-Agent: Amazon CloudFront") != NULL) ||
-                        (strstr(buf, "X-Amz-Cf-Id:") != NULL) ||
-                        (strstr(buf, "CloudFront-") != NULL);
-
     if (has_proxyc) {
+        /* Modo proxyc:on → duplo 200 (comportamento original) */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
-        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
+        write(client_sock, resp, strlen(resp));
+        write(client_sock, resp, strlen(resp));
         if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
             close(client_sock); return;
         }
-    } else if (is_websocket || is_cloudfront) {
-        char ws_resp[1024];
+    } else {
+        /* Para todas as outras requisições:
+         * responde 101 com headers completos de WebSocket */
         char *key_start = strstr(buf, "Sec-WebSocket-Key:");
         char ws_key[256] = {0};
         if (key_start) {
@@ -316,8 +311,8 @@ static void handle_client(int client_sock) {
             strcpy(accept_key, generate_websocket_accept(ws_key));
         }
 
-        /* Construção correta do cabeçalho 101 */
-        snprintf(ws_resp, sizeof(ws_resp),
+        /* Monta resposta 101 sempre com Upgrade/Connection */
+        snprintf(resp, sizeof(resp),
             "HTTP/1.1 101 %s\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
@@ -327,48 +322,18 @@ static void handle_client(int client_sock) {
             ws_key[0] ? "Sec-WebSocket-Accept: " : "",
             accept_key);
 
-        if (write(client_sock, ws_resp, strlen(ws_resp)) < 0) {
+        if (write(client_sock, resp, strlen(resp)) < 0) {
             close(client_sock); return;
         }
 
-        if (is_cloudfront) {
-            if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-                close(client_sock); return;
-            }
-
-            BackendRule *backend = get_cloudfront_backend();
-            if (backend) {
-                int server_sock = connect_backend(backend->host, backend->port);
-                if (server_sock >= 0) {
-                    pthread_t t1, t2;
-                    int *c2s = malloc(2 * sizeof(int));
-                    c2s[0] = client_sock; c2s[1] = server_sock;
-                    int *s2c = malloc(2 * sizeof(int));
-                    s2c[0] = server_sock; s2c[1] = client_sock;
-
-                    pthread_create(&t1, NULL, transfer, c2s);
-                    pthread_create(&t2, NULL, transfer, s2c);
-                    pthread_join(t1, NULL);
-                    pthread_join(t2, NULL);
-
-                    close(server_sock);
-                    close(client_sock);
-                    return;
-                }
-            }
-            close(client_sock);
-            return;
-        }
-    } else {
-        snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
+        /* Consome o request original (GET) para limpar o buffer */
         if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
             close(client_sock); return;
         }
-        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
+        /* NÃO envia 200 OK extra – vai direto para a ponte */
     }
 
+    /* A partir daqui o fluxo é idêntico: peek do próximo payload → backend */
     char peek[BUFFER_SIZE] = {0};
     int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, peeked);
@@ -390,10 +355,8 @@ static void handle_client(int client_sock) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Implementação das funções auxiliares                                */
+/* Base64 encoder simples                                               */
 /* ------------------------------------------------------------------ */
-
-/* Base64 encoder simples */
 static void base64_encode(const unsigned char *data, size_t len, char *out) {
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t i, j;
@@ -418,7 +381,9 @@ static void base64_encode(const unsigned char *data, size_t len, char *out) {
     out[j] = '\0';
 }
 
-/* Implementação mínima de SHA-1 (conforme RFC 3174) */
+/* ------------------------------------------------------------------ */
+/* Implementação mínima de SHA-1 (RFC 3174)                            */
+/* ------------------------------------------------------------------ */
 static void SHA1(const unsigned char *input, size_t len, unsigned char output[20]) {
     uint32_t h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE,
              h3 = 0x10325476, h4 = 0xC3D2E1F0;
@@ -426,12 +391,10 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
     uint32_t w[80];
     size_t   i;
 
-    /* Processa blocos de 64 bytes */
     while (len >= 64) {
         memcpy(msg, input, 64);
         input += 64;
         len   -= 64;
-        /* expande e processa */
         for (i = 0; i < 16; i++)
             w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
         for (i = 16; i < 80; i++)
@@ -451,13 +414,12 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
         h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
     }
 
-    /* Padding do último bloco */
     memcpy(msg, input, len);
     msg[len++] = 0x80;
     if (len > 56) {
         memset(msg + len, 0, 64 - len);
         len = 0;
-        goto process_block;   /* processa o bloco atual e reseta msg */
+        goto process_block;
     process_block:
         for (i = 0; i < 16; i++)
             w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
@@ -479,7 +441,7 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
         if (len == 0) goto final;
     }
     memset(msg + len, 0, 56 - len);
-    uint64_t bits = (uint64_t)(len - 1) * 8;   /* len já foi incrementado no 0x80 */
+    uint64_t bits = (uint64_t)(len - 1) * 8;
     msg[56] = bits >> 56; msg[57] = bits >> 48;
     msg[58] = bits >> 40; msg[59] = bits >> 32;
     msg[60] = bits >> 24; msg[61] = bits >> 16;
@@ -494,6 +456,9 @@ final:
     output[16] = h4 >> 24; output[17] = h4 >> 16; output[18] = h4 >> 8; output[19] = h4;
 }
 
+/* ------------------------------------------------------------------ */
+/* Geração do Sec-WebSocket-Accept                                     */
+/* ------------------------------------------------------------------ */
 static const char *generate_websocket_accept(const char *key) {
     static char accept[64];
     const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -506,17 +471,8 @@ static const char *generate_websocket_accept(const char *key) {
     return accept;
 }
 
-static BackendRule *get_cloudfront_backend(void) {
-    static BackendRule cf_backend = {
-        .pattern = "",
-        .host    = "your-cloudfront-endpoint.cloudfront.net",  /* substitua pelo seu */
-        .port    = 443
-    };
-    return &cf_backend;
-}
-
 /* ------------------------------------------------------------------ */
-/* accept_loop                                                         */
+/* accept_loop (com fork)                                               */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
