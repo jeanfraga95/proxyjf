@@ -12,13 +12,14 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <stdint.h>   /* para SHA1 */
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
 /* ------------------------------------------------------------------ */
-#define BUFFER_SIZE      65536  /* aumentado de 4096 para melhor throughput */
+#define BUFFER_SIZE      65536
 #define PEEK_TIMEOUT     1
-#define CONNECT_TIMEOUT  5      /* segundos máximos para connect() ao backend */
+#define CONNECT_TIMEOUT  5
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
 
@@ -45,13 +46,22 @@ static char             *DEFAULT_STATUS = "Switching Protocols";
 static int               PORT           = 80;
 static ProxyConfig       CONFIG         = {0};
 
-/* Reload via SIGHUP */
 static volatile sig_atomic_t  reload_flag  = 0;
 static int                    saved_argc   = 0;
 static char                 **saved_argv   = NULL;
 
-/* Proteção de leitura/escrita da CONFIG durante reload */
 static pthread_rwlock_t config_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* ------------------------------------------------------------------ */
+/* Protótipos – declaração antes do uso                                */
+/* ------------------------------------------------------------------ */
+static void         handle_client(int client_sock);
+static const char  *generate_websocket_accept(const char *key);
+static BackendRule *get_cloudfront_backend(void);
+
+/* Implementações das funções que estavam implícitas */
+static void base64_encode(const unsigned char *data, size_t len, char *out);
+static void SHA1(const unsigned char *input, size_t len, unsigned char output[20]);
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -103,7 +113,6 @@ static void parse_args(int argc, char *argv[]) {
         }
     }
 
-    /* Defaults se nada foi passado */
     if (new_cfg.backend_count == 0) {
         strcpy(new_cfg.backends[0].pattern, "SSH");
         strcpy(new_cfg.backends[0].host,    "0.0.0.0");
@@ -118,7 +127,6 @@ static void parse_args(int argc, char *argv[]) {
         new_cfg.status_count  = 1;
     }
 
-    /* Troca atômica da configuração */
     pthread_rwlock_wrlock(&config_lock);
     free_config(&CONFIG);
     CONFIG         = new_cfg;
@@ -130,19 +138,11 @@ static void parse_args(int argc, char *argv[]) {
 /* ------------------------------------------------------------------ */
 /* Handlers de sinal                                                    */
 /* ------------------------------------------------------------------ */
-
-/*
- * SIGHUP: sinaliza reload. accept() retornará EINTR (SA_RESTART desligado)
- * e o loop principal verificará reload_flag antes do próximo accept.
- */
 static void handle_sighup(int sig) {
     (void)sig;
     reload_flag = 1;
 }
 
-/*
- * SIGCHLD: recolhe processos filhos zumbis sem bloquear.
- */
 static void handle_sigchld(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -160,10 +160,6 @@ static int peek_data(int sock, char *buffer, int len) {
     return recv(sock, buffer, len, MSG_PEEK);
 }
 
-/*
- * Transfere dados de fds[0] → fds[1] em loop (trata writes parciais).
- * Não fecha os fds — isso fica a cargo do processo pai após o join.
- */
 static void *transfer(void *arg) {
     int    *fds = (int *)arg;
     char    buf[BUFFER_SIZE];
@@ -193,9 +189,7 @@ static const char *get_random_status(void) {
 
 static BackendRule *detect_backend(const char *data, int len) {
     pthread_rwlock_rdlock(&config_lock);
-
     int fallback = (CONFIG.backend_count > 1) ? 1 : 0;
-
     if (len <= 0) {
         BackendRule *r = &CONFIG.backends[fallback];
         pthread_rwlock_unlock(&config_lock);
@@ -215,14 +209,6 @@ static BackendRule *detect_backend(const char *data, int len) {
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* MELHORIA 1 — connect() ao backend com timeout + suporte IPv4/IPv6   */
-/* ------------------------------------------------------------------ */
-/*
- * Cria um socket para o backend detectando automaticamente se o host
- * é um endereço IPv4 ou IPv6. Usa O_NONBLOCK + select() para garantir
- * que a tentativa de conexão não bloqueie mais que CONNECT_TIMEOUT s.
- */
 static int connect_backend(const char *host, int port) {
     struct sockaddr_storage saddr    = {0};
     socklen_t               saddr_len;
@@ -231,7 +217,6 @@ static int connect_backend(const char *host, int port) {
     struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&saddr;
     struct sockaddr_in  *s4 = (struct sockaddr_in  *)&saddr;
 
-    /* Tenta interpretar o host como IPv6 primeiro, depois IPv4 */
     if (inet_pton(AF_INET6, host, &s6->sin6_addr) == 1) {
         family          = AF_INET6;
         s6->sin6_family = AF_INET6;
@@ -250,7 +235,6 @@ static int connect_backend(const char *host, int port) {
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("[backend] socket"); return -1; }
 
-    /* Coloca em modo não-bloqueante para aplicar o timeout */
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -262,7 +246,6 @@ static int connect_backend(const char *host, int port) {
     }
 
     if (r != 0) {
-        /* Aguarda o socket ficar gravável ou o timeout expirar */
         fd_set         wfds;
         struct timeval tv = {CONNECT_TIMEOUT, 0};
         FD_ZERO(&wfds);
@@ -275,7 +258,6 @@ static int connect_backend(const char *host, int port) {
             return -1;
         }
 
-        /* Verifica se o connect realmente teve êxito */
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
@@ -287,86 +269,81 @@ static int connect_backend(const char *host, int port) {
         }
     }
 
-    /* Restaura modo bloqueante para o uso normal de I/O */
     fcntl(sock, F_SETFL, flags);
     return sock;
 }
 
 /* ------------------------------------------------------------------ */
-/* Tratamento do cliente                                                */
+/* Função handle_client – agora com protótipos já declarados           */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
     char        resp[512];
     const char *status = get_random_status();
 
-    /* Peek do request para detectar o header especial */
     peek_data(client_sock, buf, sizeof(buf) - 1);
+
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
-    
-    /* Detecta se é WebSocket ou CloudFront */
+
     int is_websocket = (strstr(buf, "Upgrade: websocket") != NULL) ||
                        (strstr(buf, "upgrade: websocket") != NULL) ||
                        (strstr(buf, "Upgrade: WebSocket") != NULL);
-    
+
     int is_cloudfront = (strstr(buf, "User-Agent: Amazon CloudFront") != NULL) ||
                         (strstr(buf, "X-Amz-Cf-Id:") != NULL) ||
                         (strstr(buf, "CloudFront-") != NULL);
 
     if (has_proxyc) {
-        /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
-        write(client_sock, resp, strlen(resp));
-        /* Consome o request da fila */
+        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
+        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
         if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
             close(client_sock); return;
         }
     } else if (is_websocket || is_cloudfront) {
-        /* Modo WebSocket/CloudFront → 101 Switching Protocols com headers completos */
-        char ws_resp[512];
-        
-        /* Extrai o Sec-WebSocket-Key se presente */
+        char ws_resp[1024];
         char *key_start = strstr(buf, "Sec-WebSocket-Key:");
         char ws_key[256] = {0};
         if (key_start) {
-            key_start += 18; // pula "Sec-WebSocket-Key:"
+            key_start += 18;
             while (*key_start == ' ') key_start++;
             sscanf(key_start, "%255[^\r\n]", ws_key);
         }
-        
-        /* Resposta completa de upgrade WebSocket */
+
+        char accept_key[64] = "";
+        if (ws_key[0]) {
+            strcpy(accept_key, generate_websocket_accept(ws_key));
+        }
+
+        /* Construção correta do cabeçalho 101 */
         snprintf(ws_resp, sizeof(ws_resp),
-            "HTTP/1.1 101 Switching Protocols\r\n"
+            "HTTP/1.1 101 %s\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
-            "%s%s%s"
+            "%s%s\r\n"
             "\r\n",
             status,
             ws_key[0] ? "Sec-WebSocket-Accept: " : "",
-            ws_key[0] ? generate_websocket_accept(ws_key) : ""
-        );
-        
-        write(client_sock, ws_resp, strlen(ws_resp));
-        
-        /* Se for CloudFront, redireciona imediatamente */
+            accept_key);
+
+        if (write(client_sock, ws_resp, strlen(ws_resp)) < 0) {
+            close(client_sock); return;
+        }
+
         if (is_cloudfront) {
-            /* Consome o request atual */
             if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
                 close(client_sock); return;
             }
-            
-            /* Redireciona para o backend CloudFront */
+
             BackendRule *backend = get_cloudfront_backend();
             if (backend) {
                 int server_sock = connect_backend(backend->host, backend->port);
                 if (server_sock >= 0) {
-                    /* Pipeline mode: já conecta e faz bridge */
                     pthread_t t1, t2;
-                    int *c2s = malloc(2 * sizeof(int)); 
+                    int *c2s = malloc(2 * sizeof(int));
                     c2s[0] = client_sock; c2s[1] = server_sock;
-                    int *s2c = malloc(2 * sizeof(int)); 
+                    int *s2c = malloc(2 * sizeof(int));
                     s2c[0] = server_sock; s2c[1] = client_sock;
 
                     pthread_create(&t1, NULL, transfer, c2s);
@@ -383,22 +360,19 @@ static void handle_client(int client_sock) {
             return;
         }
     } else {
-        /* Modo padrão → 101 → consome request → 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 101 %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
+        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
         if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
             close(client_sock); return;
         }
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
+        if (write(client_sock, resp, strlen(resp)) < 0) { close(client_sock); return; }
     }
 
-    /* Peek do próximo payload para escolher o backend */
     char peek[BUFFER_SIZE] = {0};
     int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
     BackendRule *backend = detect_backend(peek, peeked);
 
-    /* MELHORIA 1: connect com timeout e suporte IPv4/IPv6 */
     int server_sock = connect_backend(backend->host, backend->port);
     if (server_sock < 0) { close(client_sock); return; }
 
@@ -415,40 +389,140 @@ static void handle_client(int client_sock) {
     close(server_sock);
 }
 
-/* Função auxiliar para gerar o WebSocket Accept key */
-static char* generate_websocket_accept(const char *key) {
+/* ------------------------------------------------------------------ */
+/* Implementação das funções auxiliares                                */
+/* ------------------------------------------------------------------ */
+
+/* Base64 encoder simples */
+static void base64_encode(const unsigned char *data, size_t len, char *out) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i, j;
+    uint32_t val;
+    int bits;
+
+    j = 0;
+    val = 0;
+    bits = -8;
+    for (i = 0; i < len; i++) {
+        val = (val << 8) | data[i];
+        bits += 8;
+        while (bits >= 0) {
+            out[j++] = table[(val >> bits) & 0x3F];
+            bits -= 6;
+        }
+    }
+    if (bits > -8) {
+        out[j++] = table[((val << 8) >> (bits + 8)) & 0x3F];
+    }
+    while (j % 4) out[j++] = '=';
+    out[j] = '\0';
+}
+
+/* Implementação mínima de SHA-1 (conforme RFC 3174) */
+static void SHA1(const unsigned char *input, size_t len, unsigned char output[20]) {
+    uint32_t h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE,
+             h3 = 0x10325476, h4 = 0xC3D2E1F0;
+    uint8_t  msg[64];
+    uint32_t w[80];
+    size_t   i;
+
+    /* Processa blocos de 64 bytes */
+    while (len >= 64) {
+        memcpy(msg, input, 64);
+        input += 64;
+        len   -= 64;
+        /* expande e processa */
+        for (i = 0; i < 16; i++)
+            w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
+        for (i = 16; i < 80; i++)
+            w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
+            w[i] = (w[i] << 1) | (w[i] >> 31);
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
+        for (i = 0; i < 80; i++) {
+            if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+            temp = (a << 5) | (a >> 27);
+            temp += f + e + k + w[i];
+            e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    }
+
+    /* Padding do último bloco */
+    memcpy(msg, input, len);
+    msg[len++] = 0x80;
+    if (len > 56) {
+        memset(msg + len, 0, 64 - len);
+        len = 0;
+        goto process_block;   /* processa o bloco atual e reseta msg */
+    process_block:
+        for (i = 0; i < 16; i++)
+            w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
+        for (i = 16; i < 80; i++)
+            w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
+            w[i] = (w[i] << 1) | (w[i] >> 31);
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
+        for (i = 0; i < 80; i++) {
+            if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+            temp = (a << 5) | (a >> 27);
+            temp += f + e + k + w[i];
+            e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+        if (len == 0) goto final;
+    }
+    memset(msg + len, 0, 56 - len);
+    uint64_t bits = (uint64_t)(len - 1) * 8;   /* len já foi incrementado no 0x80 */
+    msg[56] = bits >> 56; msg[57] = bits >> 48;
+    msg[58] = bits >> 40; msg[59] = bits >> 32;
+    msg[60] = bits >> 24; msg[61] = bits >> 16;
+    msg[62] = bits >> 8;  msg[63] = bits;
+    goto process_block;
+
+final:
+    output[0]  = h0 >> 24; output[1]  = h0 >> 16; output[2]  = h0 >> 8; output[3]  = h0;
+    output[4]  = h1 >> 24; output[5]  = h1 >> 16; output[6]  = h1 >> 8; output[7]  = h1;
+    output[8]  = h2 >> 24; output[9]  = h2 >> 16; output[10] = h2 >> 8; output[11] = h2;
+    output[12] = h3 >> 24; output[13] = h3 >> 16; output[14] = h3 >> 8; output[15] = h3;
+    output[16] = h4 >> 24; output[17] = h4 >> 16; output[18] = h4 >> 8; output[19] = h4;
+}
+
+static const char *generate_websocket_accept(const char *key) {
     static char accept[64];
     const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     char combined[512];
-    
-    snprintf(combined, sizeof(combined), "%s%s", key, magic);
-    
     unsigned char sha1[20];
+
+    snprintf(combined, sizeof(combined), "%s%s", key, magic);
     SHA1((unsigned char*)combined, strlen(combined), sha1);
-    
     base64_encode(sha1, 20, accept);
     return accept;
 }
 
-/* Função para obter backend específico do CloudFront */
-static BackendRule* get_cloudfront_backend(void) {
+static BackendRule *get_cloudfront_backend(void) {
     static BackendRule cf_backend = {
-        .host = "your-cloudfront-endpoint.cloudfront.net",
-        .port = 443  // ou 80 para HTTP
+        .pattern = "",
+        .host    = "your-cloudfront-endpoint.cloudfront.net",  /* substitua pelo seu */
+        .port    = 443
     };
     return &cf_backend;
 }
+
 /* ------------------------------------------------------------------ */
-/* MELHORIA 4 — accept_loop sem thread wrapper (chamado direto do main) */
-/* MELHORIA 3 — verifica reload_flag antes de cada accept()            */
-/* MELHORIA 2 — aceita clientes IPv4 e IPv6 via sockaddr_storage       */
+/* accept_loop                                                         */
 /* ------------------------------------------------------------------ */
 static void accept_loop(int server_sock) {
     struct sockaddr_storage client_addr;
     socklen_t               client_len = sizeof(client_addr);
 
     while (1) {
-        /* MELHORIA 3: reload de config via SIGHUP sem reiniciar o processo */
         if (reload_flag) {
             reload_flag = 0;
             parse_args(saved_argc, saved_argv);
@@ -461,12 +535,11 @@ static void accept_loop(int server_sock) {
                                  (struct sockaddr *)&client_addr,
                                  &client_len);
         if (client_sock < 0) {
-            if (errno == EINTR) continue; /* sinal recebido — testa reload_flag */
+            if (errno == EINTR) continue;
             perror("accept");
             continue;
         }
 
-        /* Log do IP do cliente — MELHORIA 2: suporta IPv4 e IPv6 */
         char client_ip[INET6_ADDRSTRLEN] = {0};
         if (client_addr.ss_family == AF_INET6) {
             inet_ntop(AF_INET6,
@@ -485,12 +558,10 @@ static void accept_loop(int server_sock) {
             continue;
         }
         if (pid == 0) {
-            /* Processo filho */
             close(server_sock);
             handle_client(client_sock);
             exit(0);
         }
-        /* Processo pai */
         close(client_sock);
     }
 }
@@ -500,36 +571,26 @@ static void accept_loop(int server_sock) {
 /* ------------------------------------------------------------------ */
 int main(int argc, char *argv[]) {
     srand(time(NULL));
-
-    /* Ignora SIGPIPE: evita crash em writes para sockets fechados */
     signal(SIGPIPE, SIG_IGN);
 
-    /* Salva args para uso no reload via SIGHUP */
     saved_argc = argc;
     saved_argv = argv;
     parse_args(argc, argv);
 
-    /* MELHORIA 3: instala handler de SIGHUP para reload sem restart.
-     * SA_RESTART desligado → accept() retorna EINTR ao receber SIGHUP,
-     * permitindo que o loop verifique reload_flag imediatamente.         */
     struct sigaction sa_hup = {0};
     sa_hup.sa_handler = handle_sighup;
     sigaction(SIGHUP, &sa_hup, NULL);
 
-    /* Recolhe processos filhos zumbis automaticamente */
     struct sigaction sa_chld = {0};
     sa_chld.sa_handler = handle_sigchld;
     sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa_chld, NULL);
 
-    /* MELHORIA 2: socket AF_INET6 com IPV6_V6ONLY = 0
-     * → aceita conexões IPv4 (como ::ffff:x.x.x.x) e IPv6 no mesmo fd. */
     int server_sock = socket(AF_INET6, SOCK_STREAM, 0);
     if (server_sock < 0) { perror("socket"); return 1; }
 
     int opt = 1;
     setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
     int v6only = 0;
     setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
@@ -550,7 +611,6 @@ int main(int argc, char *argv[]) {
            PORT, CONFIG.status_count, CONFIG.backend_count);
     printf("Recarregar config: kill -HUP %d\n", getpid());
 
-    /* MELHORIA 4: accept_loop chamado diretamente — sem thread wrapper */
     accept_loop(server_sock);
 
     pthread_rwlock_destroy(&config_lock);
