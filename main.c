@@ -276,42 +276,216 @@ static int connect_backend(const char *host, int port) {
 /* ------------------------------------------------------------------ */
 /* Função principal de tratamento do cliente                            */
 /* ------------------------------------------------------------------ */
-static void handle_client(int client_sock) {
-    char        buf[BUFFER_SIZE] = {0};
-    char        resp[1024];
-    const char *status = get_random_status();
+/* Funções auxiliares para parsing */
+static int parse_content_length(const char *data, size_t len) {
+    const char *cl = strstr(data, "Content-Length:");
+    if (!cl) {
+        cl = strstr(data, "Content-length:");
+        if (!cl) return -1;
+    }
+    
+    cl += 15; // Pula "Content-Length:"
+    while (*cl == ' ' || *cl == '\t') cl++;
+    
+    char *end = strstr(cl, "\r\n");
+    if (!end) end = strstr(cl, "\n");
+    if (!end) return -1;
+    
+    char temp[32] = {0};
+    size_t copy_len = (end - cl) < 31 ? (end - cl) : 31;
+    strncpy(temp, cl, copy_len);
+    
+    long long val = strtoll(temp, NULL, 10);
+    if (val > INT_MAX) return INT_MAX;
+    return (int)val;
+}
 
-    /* Peek inicial para detectar o header especial */
-    peek_data(client_sock, buf, sizeof(buf) - 1);
+static char* find_headers_end(const char *data, size_t len) {
+    char *end = strstr(data, "\r\n\r\n");
+    if (end) return end + 4;
+    
+    end = strstr(data, "\n\n");
+    if (end) return end + 2;
+    
+    return NULL;
+}
 
-    int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
-                     (strstr(buf, "proxyc: on") != NULL);
+static int is_request_complete(const char *data, size_t len) {
+    if (len < 4) return 0;
+    
+    char *headers_end = find_headers_end(data, len);
+    if (!headers_end) return 0;
+    
+    int content_len = parse_content_length(data, len);
+    
+    if (content_len > 0) {
+        size_t body_start = (size_t)(headers_end - data);
+        size_t total_needed = body_start + content_len;
+        return (len >= total_needed);
+    }
+    
+    return 1;
+}
 
-    if (has_proxyc) {
-        /* Modo proxyc:on → duplo 200 (comportamento original) */
+/* Estrutura para armazenar requisição */
+typedef struct {
+    char *data;
+    size_t length;
+    size_t offset;
+    int is_complete;
+    int content_length;
+    char method[32];
+    char host[256];
+    char path[512];
+    int is_websocket;
+    int has_proxyc;
+} HttpRequest;
+
+/* Divide o buffer em requisições individuais */
+static int split_requests(char *buffer, size_t len, HttpRequest *requests, int max_requests) {
+    int count = 0;
+    size_t offset = 0;
+    
+    while (offset < len && count < max_requests) {
+        char *remaining = buffer + offset;
+        size_t remaining_len = len - offset;
+        
+        // Pula linhas vazias iniciais
+        while (remaining_len > 0 && (*remaining == '\r' || *remaining == '\n')) {
+            remaining++;
+            offset++;
+            remaining_len--;
+        }
+        
+        if (remaining_len < 4) break;
+        
+        // Encontra o método HTTP
+        char *method_end = strstr(remaining, " ");
+        if (!method_end) break;
+        
+        size_t method_len = method_end - remaining;
+        if (method_len >= sizeof(requests[count].method) - 1) break;
+        
+        strncpy(requests[count].method, remaining, method_len);
+        requests[count].method[method_len] = '\0';
+        
+        // Encontra fim dos headers
+        char *headers_end = find_headers_end(remaining, remaining_len);
+        if (!headers_end) break;
+        
+        size_t headers_len = headers_end - remaining;
+        
+        // Extrai Host
+        char *host_start = strstr(remaining, "Host:");
+        if (host_start && host_start < headers_end) {
+            host_start += 5;
+            while (*host_start == ' ' || *host_start == '\t') host_start++;
+            char *host_end = strstr(host_start, "\r\n");
+            if (!host_end) host_end = strstr(host_start, "\n");
+            if (host_end && host_end < headers_end) {
+                size_t host_len = host_end - host_start;
+                if (host_len < sizeof(requests[count].host) - 1) {
+                    strncpy(requests[count].host, host_start, host_len);
+                    requests[count].host[host_len] = '\0';
+                }
+            }
+        }
+        
+        // Extrai Path
+        char *path_start = method_end + 1;
+        char *path_end = strstr(path_start, " HTTP/");
+        if (!path_end) path_end = strstr(path_start, " ");
+        if (path_end && path_end < headers_end) {
+            size_t path_len = path_end - path_start;
+            if (path_len < sizeof(requests[count].path) - 1) {
+                strncpy(requests[count].path, path_start, path_len);
+                requests[count].path[path_len] = '\0';
+            }
+        }
+        
+        // Detecta WebSocket
+        requests[count].is_websocket = (strstr(remaining, "Upgrade: websocket") != NULL ||
+                                        strstr(remaining, "Upgrade: WebSocket") != NULL);
+        
+        // Detecta proxyc:on
+        requests[count].has_proxyc = (strstr(remaining, "proxyc:on") != NULL ||
+                                      strstr(remaining, "proxyc: on") != NULL);
+        
+        // Content-Length
+        int content_len = parse_content_length(remaining, remaining_len);
+        requests[count].content_length = content_len;
+        
+        // Determina tamanho total da requisição
+        size_t total_size;
+        if (content_len > 0) {
+            size_t body_start = headers_len;
+            total_size = headers_len + content_len;
+            requests[count].is_complete = (remaining_len >= total_size);
+        } else {
+            total_size = headers_len;
+            requests[count].is_complete = 1;
+        }
+        
+        // Verifica delimitador [split]
+        char *split_delim = strstr(headers_end, "[split]");
+        if (split_delim) {
+            total_size = split_delim - remaining;
+            requests[count].is_complete = 1;
+        }
+        
+        // Aloca e copia os dados da requisição
+        requests[count].data = malloc(total_size + 1);
+        if (requests[count].data) {
+            memcpy(requests[count].data, remaining, total_size);
+            requests[count].data[total_size] = '\0';
+            requests[count].length = total_size;
+            requests[count].offset = offset;
+        }
+        
+        offset += total_size;
+        count++;
+        
+        // Se encontrou [split], pula ele
+        if (split_delim) {
+            offset += 7;
+        }
+    }
+    
+    return count;
+}
+
+/* Envia resposta para uma requisição específica */
+static void send_response_for_request(int client_sock, HttpRequest *req, const char *status) {
+    char resp[4096];
+    char ws_key[256] = {0};
+    char accept_key[64] = "";
+    
+    if (req->has_proxyc) {
+        /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
-        }
-    } else {
-        /* Para todas as outras requisições:
-         * responde 101 com headers completos de WebSocket */
-        char *key_start = strstr(buf, "Sec-WebSocket-Key:");
-        char ws_key[256] = {0};
+    } else if (req->is_websocket) {
+        /* Resposta WebSocket 101 */
+        char *key_start = strstr(req->data, "Sec-WebSocket-Key:");
         if (key_start) {
             key_start += 18;
-            while (*key_start == ' ') key_start++;
-            sscanf(key_start, "%255[^\r\n]", ws_key);
+            while (*key_start == ' ' || *key_start == '\t') key_start++;
+            char *key_end = strstr(key_start, "\r\n");
+            if (!key_end) key_end = strstr(key_start, "\n");
+            if (key_end) {
+                size_t key_len = key_end - key_start;
+                if (key_len < sizeof(ws_key) - 1) {
+                    strncpy(ws_key, key_start, key_len);
+                    ws_key[key_len] = '\0';
+                }
+            }
         }
-
-        char accept_key[64] = "";
+        
         if (ws_key[0]) {
             strcpy(accept_key, generate_websocket_accept(ws_key));
         }
-
-        /* Monta resposta 101 sempre com Upgrade/Connection */
+        
         snprintf(resp, sizeof(resp),
             "HTTP/1.1 101 %s\r\n"
             "Upgrade: websocket\r\n"
@@ -321,37 +495,133 @@ static void handle_client(int client_sock) {
             status,
             ws_key[0] ? "Sec-WebSocket-Accept: " : "",
             accept_key);
-
-        if (write(client_sock, resp, strlen(resp)) < 0) {
-            close(client_sock); return;
-        }
-
-        /* Consome o request original (GET) para limpar o buffer */
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
-        }
-        /* NÃO envia 200 OK extra – vai direto para a ponte */
+        write(client_sock, resp, strlen(resp));
+    } else {
+        /* Resposta padrão 200 OK */
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+        write(client_sock, resp, strlen(resp));
     }
+}
 
-    /* A partir daqui o fluxo é idêntico: peek do próximo payload → backend */
-    char peek[BUFFER_SIZE] = {0};
-    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
-    BackendRule *backend = detect_backend(peek, peeked);
-
-    int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) { close(client_sock); return; }
-
-    pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
-    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
-
-    pthread_create(&t1, NULL, transfer, c2s);
-    pthread_create(&t2, NULL, transfer, s2c);
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
-
+/* FUNÇÃO PRINCIPAL REFATORADA */
+static void handle_client(int client_sock) {
+    char buffer[BUFFER_SIZE] = {0};
+    const char *status = get_random_status();
+    
+    /* Lê todos os dados disponíveis inicialmente */
+    ssize_t total_read = 0;
+    ssize_t n;
+    
+    // Primeiro tenta ler com MSG_DONTWAIT (dados já disponíveis)
+    while ((n = recv(client_sock, buffer + total_read, 
+                     BUFFER_SIZE - total_read - 1, MSG_DONTWAIT)) > 0) {
+        total_read += n;
+        if (total_read >= BUFFER_SIZE - 1) break;
+    }
+    
+    // Se não leu nada, faz blocking read
+    if (total_read == 0) {
+        n = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
+        if (n <= 0) {
+            close(client_sock);
+            return;
+        }
+        total_read = n;
+    }
+    
+    buffer[total_read] = '\0';
+    
+    /* Divide em requisições individuais */
+    HttpRequest requests[MAX_REQUESTS] = {0};
+    int req_count = split_requests(buffer, total_read, requests, MAX_REQUESTS);
+    
+    if (req_count == 0) {
+        close(client_sock);
+        return;
+    }
+    
+    /* Processa cada requisição */
+    int websocket_index = -1;
+    size_t processed_until = 0;
+    
+    for (int i = 0; i < req_count; i++) {
+        /* Envia resposta apropriada */
+        send_response_for_request(client_sock, &requests[i], status);
+        
+        /* Marca se é WebSocket */
+        if (requests[i].is_websocket) {
+            websocket_index = i;
+        }
+        
+        /* Atualiza posição processada */
+        if (requests[i].offset + requests[i].length > processed_until) {
+            processed_until = requests[i].offset + requests[i].length;
+        }
+        
+        /* Libera memória */
+        if (requests[i].data) {
+            free(requests[i].data);
+        }
+    }
+    
+    /* Se tem WebSocket, mantém conexão para proxy */
+    if (websocket_index >= 0) {
+        /* Dados extras que podem ser frames WebSocket já no buffer */
+        char peek[BUFFER_SIZE] = {0};
+        int peeked = 0;
+        
+        if (processed_until < (size_t)total_read) {
+            /* Há dados extras no buffer (provavelmente WebSocket frames) */
+            memcpy(peek, buffer + processed_until, total_read - processed_until);
+            peeked = total_read - processed_until;
+        } else {
+            /* Tenta ler novos dados */
+            peeked = recv(client_sock, peek, sizeof(peek) - 1, MSG_DONTWAIT);
+            if (peeked < 0) peeked = 0;
+        }
+        
+        /* Detecta backend */
+        BackendRule *backend = detect_backend(peek, peeked);
+        if (!backend) {
+            close(client_sock);
+            return;
+        }
+        
+        int server_sock = connect_backend(backend->host, backend->port);
+        if (server_sock < 0) {
+            close(client_sock);
+            return;
+        }
+        
+        /* Se temos dados em peek, envia para o backend */
+        if (peeked > 0) {
+            write(server_sock, peek, peeked);
+        }
+        
+        /* Inicia proxy bidirecional */
+        pthread_t t1, t2;
+        int *c2s = malloc(2 * sizeof(int));
+        int *s2c = malloc(2 * sizeof(int));
+        
+        if (c2s && s2c) {
+            c2s[0] = client_sock;
+            c2s[1] = server_sock;
+            s2c[0] = server_sock;
+            s2c[1] = client_sock;
+            
+            pthread_create(&t1, NULL, transfer, c2s);
+            pthread_create(&t2, NULL, transfer, s2c);
+            pthread_join(t1, NULL);
+            pthread_join(t2, NULL);
+            
+            free(c2s);
+            free(s2c);
+        }
+        
+        close(server_sock);
+    }
+    
     close(client_sock);
-    close(server_sock);
 }
 
 /* ------------------------------------------------------------------ */
