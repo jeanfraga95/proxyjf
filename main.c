@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <stdint.h>
+#include <limits.h>  // Adicionado para INT_MAX
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -22,7 +23,7 @@
 #define CONNECT_TIMEOUT  5
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
-#define MAX_REQUESTS 32
+#define MAX_REQUESTS     32
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
@@ -39,6 +40,20 @@ typedef struct {
     BackendRule backends[MAX_BACKEND];
     int         backend_count;
 } ProxyConfig;
+
+/* Estrutura para armazenar requisição */
+typedef struct {
+    char *data;
+    size_t length;
+    size_t offset;
+    int is_complete;
+    int content_length;
+    char method[32];
+    char host[256];
+    char path[512];
+    int is_websocket;
+    int has_proxyc;
+} HttpRequest;
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                              */
@@ -63,6 +78,10 @@ static void         SHA1(const unsigned char *input, size_t len, unsigned char o
 static BackendRule *detect_backend(const char *data, int len);
 static int          connect_backend(const char *host, int port);
 static void        *transfer(void *arg);
+static int          parse_content_length(const char *data, size_t len);
+static char*        find_headers_end(const char *data, size_t len);
+static int          split_requests(char *buffer, size_t len, HttpRequest *requests, int max_requests);
+static void         send_response_for_request(int client_sock, HttpRequest *req, const char *status);
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -275,10 +294,10 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Função principal de tratamento do cliente                            */
+/* Funções de parsing de HTTP                                          */
 /* ------------------------------------------------------------------ */
-/* Funções auxiliares para parsing */
 static int parse_content_length(const char *data, size_t len) {
+    (void)len; // Evita warning unused parameter
     const char *cl = strstr(data, "Content-Length:");
     if (!cl) {
         cl = strstr(data, "Content-length:");
@@ -293,7 +312,7 @@ static int parse_content_length(const char *data, size_t len) {
     if (!end) return -1;
     
     char temp[32] = {0};
-    size_t copy_len = (end - cl) < 31 ? (end - cl) : 31;
+    size_t copy_len = (size_t)(end - cl) < 31 ? (size_t)(end - cl) : 31;
     strncpy(temp, cl, copy_len);
     
     long long val = strtoll(temp, NULL, 10);
@@ -302,6 +321,7 @@ static int parse_content_length(const char *data, size_t len) {
 }
 
 static char* find_headers_end(const char *data, size_t len) {
+    (void)len; // Evita warning unused parameter
     char *end = strstr(data, "\r\n\r\n");
     if (end) return end + 4;
     
@@ -310,37 +330,6 @@ static char* find_headers_end(const char *data, size_t len) {
     
     return NULL;
 }
-
-static int is_request_complete(const char *data, size_t len) {
-    if (len < 4) return 0;
-    
-    char *headers_end = find_headers_end(data, len);
-    if (!headers_end) return 0;
-    
-    int content_len = parse_content_length(data, len);
-    
-    if (content_len > 0) {
-        size_t body_start = (size_t)(headers_end - data);
-        size_t total_needed = body_start + content_len;
-        return (len >= total_needed);
-    }
-    
-    return 1;
-}
-
-/* Estrutura para armazenar requisição */
-typedef struct {
-    char *data;
-    size_t length;
-    size_t offset;
-    int is_complete;
-    int content_length;
-    char method[32];
-    char host[256];
-    char path[512];
-    int is_websocket;
-    int has_proxyc;
-} HttpRequest;
 
 /* Divide o buffer em requisições individuais */
 static int split_requests(char *buffer, size_t len, HttpRequest *requests, int max_requests) {
@@ -364,7 +353,7 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
         char *method_end = strstr(remaining, " ");
         if (!method_end) break;
         
-        size_t method_len = method_end - remaining;
+        size_t method_len = (size_t)(method_end - remaining);
         if (method_len >= sizeof(requests[count].method) - 1) break;
         
         strncpy(requests[count].method, remaining, method_len);
@@ -374,7 +363,7 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
         char *headers_end = find_headers_end(remaining, remaining_len);
         if (!headers_end) break;
         
-        size_t headers_len = headers_end - remaining;
+        size_t headers_len = (size_t)(headers_end - remaining);
         
         // Extrai Host
         char *host_start = strstr(remaining, "Host:");
@@ -384,7 +373,7 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
             char *host_end = strstr(host_start, "\r\n");
             if (!host_end) host_end = strstr(host_start, "\n");
             if (host_end && host_end < headers_end) {
-                size_t host_len = host_end - host_start;
+                size_t host_len = (size_t)(host_end - host_start);
                 if (host_len < sizeof(requests[count].host) - 1) {
                     strncpy(requests[count].host, host_start, host_len);
                     requests[count].host[host_len] = '\0';
@@ -397,7 +386,7 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
         char *path_end = strstr(path_start, " HTTP/");
         if (!path_end) path_end = strstr(path_start, " ");
         if (path_end && path_end < headers_end) {
-            size_t path_len = path_end - path_start;
+            size_t path_len = (size_t)(path_end - path_start);
             if (path_len < sizeof(requests[count].path) - 1) {
                 strncpy(requests[count].path, path_start, path_len);
                 requests[count].path[path_len] = '\0';
@@ -419,7 +408,6 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
         // Determina tamanho total da requisição
         size_t total_size;
         if (content_len > 0) {
-            size_t body_start = headers_len;
             total_size = headers_len + content_len;
             requests[count].is_complete = (remaining_len >= total_size);
         } else {
@@ -430,7 +418,7 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
         // Verifica delimitador [split]
         char *split_delim = strstr(headers_end, "[split]");
         if (split_delim) {
-            total_size = split_delim - remaining;
+            total_size = (size_t)(split_delim - remaining);
             requests[count].is_complete = 1;
         }
         
@@ -448,7 +436,7 @@ static int split_requests(char *buffer, size_t len, HttpRequest *requests, int m
         
         // Se encontrou [split], pula ele
         if (split_delim) {
-            offset += 7;
+            offset += 7; // "[split]" length
         }
     }
     
@@ -464,8 +452,8 @@ static void send_response_for_request(int client_sock, HttpRequest *req, const c
     if (req->has_proxyc) {
         /* Modo proxyc:on → duplo 200 */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
-        write(client_sock, resp, strlen(resp));
+        if (write(client_sock, resp, strlen(resp)) < 0) return;
+        if (write(client_sock, resp, strlen(resp)) < 0) return;
     } else if (req->is_websocket) {
         /* Resposta WebSocket 101 */
         char *key_start = strstr(req->data, "Sec-WebSocket-Key:");
@@ -475,7 +463,7 @@ static void send_response_for_request(int client_sock, HttpRequest *req, const c
             char *key_end = strstr(key_start, "\r\n");
             if (!key_end) key_end = strstr(key_start, "\n");
             if (key_end) {
-                size_t key_len = key_end - key_start;
+                size_t key_len = (size_t)(key_end - key_start);
                 if (key_len < sizeof(ws_key) - 1) {
                     strncpy(ws_key, key_start, key_len);
                     ws_key[key_len] = '\0';
@@ -484,7 +472,8 @@ static void send_response_for_request(int client_sock, HttpRequest *req, const c
         }
         
         if (ws_key[0]) {
-            strcpy(accept_key, generate_websocket_accept(ws_key));
+            const char *accept = generate_websocket_accept(ws_key);
+            strncpy(accept_key, accept, sizeof(accept_key) - 1);
         }
         
         snprintf(resp, sizeof(resp),
@@ -496,15 +485,17 @@ static void send_response_for_request(int client_sock, HttpRequest *req, const c
             status,
             ws_key[0] ? "Sec-WebSocket-Accept: " : "",
             accept_key);
-        write(client_sock, resp, strlen(resp));
+        if (write(client_sock, resp, strlen(resp)) < 0) return;
     } else {
         /* Resposta padrão 200 OK */
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-        write(client_sock, resp, strlen(resp));
+        if (write(client_sock, resp, strlen(resp)) < 0) return;
     }
 }
 
-/* FUNÇÃO PRINCIPAL REFATORADA */
+/* ------------------------------------------------------------------ */
+/* FUNÇÃO PRINCIPAL DE TRATAMENTO DO CLIENTE                          */
+/* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char buffer[BUFFER_SIZE] = {0};
     const char *status = get_random_status();
@@ -574,7 +565,7 @@ static void handle_client(int client_sock) {
         if (processed_until < (size_t)total_read) {
             /* Há dados extras no buffer (provavelmente WebSocket frames) */
             memcpy(peek, buffer + processed_until, total_read - processed_until);
-            peeked = total_read - processed_until;
+            peeked = (int)(total_read - processed_until);
         } else {
             /* Tenta ler novos dados */
             peeked = recv(client_sock, peek, sizeof(peek) - 1, MSG_DONTWAIT);
@@ -596,7 +587,11 @@ static void handle_client(int client_sock) {
         
         /* Se temos dados em peek, envia para o backend */
         if (peeked > 0) {
-            write(server_sock, peek, peeked);
+            if (write(server_sock, peek, peeked) < 0) {
+                close(server_sock);
+                close(client_sock);
+                return;
+            }
         }
         
         /* Inicia proxy bidirecional */
@@ -617,6 +612,9 @@ static void handle_client(int client_sock) {
             
             free(c2s);
             free(s2c);
+        } else {
+            if (c2s) free(c2s);
+            if (s2c) free(s2c);
         }
         
         close(server_sock);
@@ -668,9 +666,10 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
         len   -= 64;
         for (i = 0; i < 16; i++)
             w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
-        for (i = 16; i < 80; i++)
+        for (i = 16; i < 80; i++) {
             w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
             w[i] = (w[i] << 1) | (w[i] >> 31);
+        }
 
         uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
         for (i = 0; i < 80; i++) {
@@ -694,9 +693,10 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
     process_block:
         for (i = 0; i < 16; i++)
             w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
-        for (i = 16; i < 80; i++)
+        for (i = 16; i < 80; i++) {
             w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
             w[i] = (w[i] << 1) | (w[i] >> 31);
+        }
 
         uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
         for (i = 0; i < 80; i++) {
