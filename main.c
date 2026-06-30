@@ -279,13 +279,21 @@ static int connect_backend(const char *host, int port) {
 /* ------------------------------------------------------------------ */
 /* Função principal de tratamento do cliente - VERSÃO ORIGINAL CORRIGIDA */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Função principal de tratamento do cliente - CORRIGIDA              */
+/* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
     char        resp[4096];
     const char *status = get_random_status();
+    int         is_websocket = 0;
 
     /* Peek inicial para detectar o header especial */
-    peek_data(client_sock, buf, sizeof(buf) - 1);
+    int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
+    if (peeked <= 0) {
+        close(client_sock);
+        return;
+    }
 
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
@@ -295,60 +303,120 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
+        
+        /* Consome APENAS a requisição atual, não tudo */
+        char drain[4096];
+        int n = recv(client_sock, drain, sizeof(drain) - 1, 0);
+        if (n <= 0) {
+            close(client_sock);
+            return;
         }
     } else {
-        /* Para todas as outras requisições:
-         * responde 101 com headers completos de WebSocket */
-        char *key_start = strstr(buf, "Sec-WebSocket-Key:");
-        char ws_key[256] = {0};
-        if (key_start) {
-            key_start += 18;
-            while (*key_start == ' ') key_start++;
-            sscanf(key_start, "%255[^\r\n]", ws_key);
-        }
+        /* Verifica se é WebSocket */
+        is_websocket = (strstr(buf, "Upgrade: websocket") != NULL ||
+                        strstr(buf, "Upgrade: WebSocket") != NULL);
 
-        char accept_key[64] = "";
-        if (ws_key[0]) {
-            strcpy(accept_key, generate_websocket_accept(ws_key));
-        }
+        if (is_websocket) {
+            /* Resposta WebSocket 101 */
+            char *key_start = strstr(buf, "Sec-WebSocket-Key:");
+            char ws_key[256] = {0};
+            if (key_start) {
+                key_start += 18;
+                while (*key_start == ' ') key_start++;
+                char *key_end = strstr(key_start, "\r\n");
+                if (!key_end) key_end = strstr(key_start, "\n");
+                if (key_end) {
+                    size_t key_len = key_end - key_start;
+                    if (key_len < sizeof(ws_key) - 1) {
+                        strncpy(ws_key, key_start, key_len);
+                        ws_key[key_len] = '\0';
+                    }
+                }
+            }
 
-        /* Monta resposta 101 sempre com Upgrade/Connection */
-        snprintf(resp, sizeof(resp),
-            "HTTP/1.1 101 %s\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "%s%s\r\n"
-            "\r\n",
-            status,
-            ws_key[0] ? "Sec-WebSocket-Accept: " : "",
-            accept_key);
+            char accept_key[64] = "";
+            if (ws_key[0]) {
+                strcpy(accept_key, generate_websocket_accept(ws_key));
+            }
 
-        if (write(client_sock, resp, strlen(resp)) < 0) {
-            close(client_sock); return;
-        }
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 101 %s\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "%s%s\r\n"
+                "\r\n",
+                status,
+                ws_key[0] ? "Sec-WebSocket-Accept: " : "",
+                accept_key);
 
-        /* Consome o request original (GET) para limpar o buffer */
-        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
-            close(client_sock); return;
+            if (write(client_sock, resp, strlen(resp)) < 0) {
+                close(client_sock);
+                return;
+            }
+        } else {
+            /* Requisição HTTP normal - responde 200 */
+            snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
+            if (write(client_sock, resp, strlen(resp)) < 0) {
+                close(client_sock);
+                return;
+            }
         }
-        /* NÃO envia 200 OK extra – vai direto para a ponte */
     }
 
-    /* A partir daqui o fluxo é idêntico: peek do próximo payload → backend */
-    char peek[BUFFER_SIZE] = {0};
-    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
-    BackendRule *backend = detect_backend(peek, peeked);
+    /* ================================================================
+     * IMPORTANTE: Agora precisamos ler os dados REAIS do cliente
+     * e enviar para o backend, SEM CONSUMIR dados que já foram lidos
+     * ================================================================ */
+
+    /* Detecta backend baseado no peek inicial */
+    BackendRule *backend = detect_backend(buf, peeked);
+    if (!backend) {
+        close(client_sock);
+        return;
+    }
 
     int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) { close(client_sock); return; }
-
-    /* Se temos dados em peek, envia para o backend */
-    if (peeked > 0) {
-        write(server_sock, peek, peeked);
+    if (server_sock < 0) {
+        close(client_sock);
+        return;
     }
 
+    /* ================================================================
+     * Envia os dados que já foram lidos (peek) para o backend
+     * Mas cuidado: precisamos enviar APENAS os dados que não fazem
+     * parte da requisição HTTP (para WebSocket, são os frames)
+     * ================================================================ */
+
+    if (is_websocket) {
+        /* Para WebSocket, precisamos encontrar onde termina a requisição HTTP
+         * e enviar apenas os dados extras (frames WebSocket) */
+        
+        char *headers_end = strstr(buf, "\r\n\r\n");
+        if (!headers_end) headers_end = strstr(buf, "\n\n");
+        
+        if (headers_end) {
+            size_t headers_len = (headers_end - buf) + 4; // +4 para \r\n\r\n
+            if (peeked > (int)headers_len) {
+                /* Tem dados extras (frames WebSocket) */
+                if (write(server_sock, buf + headers_len, peeked - headers_len) < 0) {
+                    close(server_sock);
+                    close(client_sock);
+                    return;
+                }
+            }
+        }
+    } else {
+        /* Para HTTP normal, envia tudo que foi lido */
+        if (write(server_sock, buf, peeked) < 0) {
+            close(server_sock);
+            close(client_sock);
+            return;
+        }
+    }
+
+    /* ================================================================
+     * Agora inicia o proxy bidirecional para o fluxo contínuo
+     * ================================================================ */
     pthread_t t1, t2;
     int *c2s = malloc(2 * sizeof(int)); 
     int *s2c = malloc(2 * sizeof(int));
@@ -369,6 +437,9 @@ static void handle_client(int client_sock) {
     } else {
         if (c2s) free(c2s);
         if (s2c) free(s2c);
+        close(server_sock);
+        close(client_sock);
+        return;
     }
 
     close(client_sock);
