@@ -13,7 +13,6 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <stdint.h>
-#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /* Constantes                                                           */
@@ -23,7 +22,6 @@
 #define CONNECT_TIMEOUT  5
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
-#define MAX_REQUESTS     32
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
@@ -64,7 +62,6 @@ static void         SHA1(const unsigned char *input, size_t len, unsigned char o
 static BackendRule *detect_backend(const char *data, int len);
 static int          connect_backend(const char *host, int port);
 static void        *transfer(void *arg);
-static int          peek_data(int sock, char *buffer, int len);
 
 /* ------------------------------------------------------------------ */
 /* Gerenciamento de configuração                                        */
@@ -277,23 +274,15 @@ static int connect_backend(const char *host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Função principal de tratamento do cliente - VERSÃO ORIGINAL CORRIGIDA */
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* Função principal de tratamento do cliente - CORRIGIDA              */
+/* Função principal de tratamento do cliente                            */
 /* ------------------------------------------------------------------ */
 static void handle_client(int client_sock) {
     char        buf[BUFFER_SIZE] = {0};
-    char        resp[4096];
+    char        resp[1024];
     const char *status = get_random_status();
-    int         is_websocket = 0;
 
     /* Peek inicial para detectar o header especial */
-    int peeked = peek_data(client_sock, buf, sizeof(buf) - 1);
-    if (peeked <= 0) {
-        close(client_sock);
-        return;
-    }
+    peek_data(client_sock, buf, sizeof(buf) - 1);
 
     int has_proxyc = (strstr(buf, "proxyc:on")  != NULL) ||
                      (strstr(buf, "proxyc: on") != NULL);
@@ -303,144 +292,63 @@ static void handle_client(int client_sock) {
         snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
         write(client_sock, resp, strlen(resp));
         write(client_sock, resp, strlen(resp));
-        
-        /* Consome APENAS a requisição atual, não tudo */
-        char drain[4096];
-        int n = recv(client_sock, drain, sizeof(drain) - 1, 0);
-        if (n <= 0) {
-            close(client_sock);
-            return;
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
         }
     } else {
-        /* Verifica se é WebSocket */
-        is_websocket = (strstr(buf, "Upgrade: websocket") != NULL ||
-                        strstr(buf, "Upgrade: WebSocket") != NULL);
-
-        if (is_websocket) {
-            /* Resposta WebSocket 101 */
-            char *key_start = strstr(buf, "Sec-WebSocket-Key:");
-            char ws_key[256] = {0};
-            if (key_start) {
-                key_start += 18;
-                while (*key_start == ' ') key_start++;
-                char *key_end = strstr(key_start, "\r\n");
-                if (!key_end) key_end = strstr(key_start, "\n");
-                if (key_end) {
-                    size_t key_len = key_end - key_start;
-                    if (key_len < sizeof(ws_key) - 1) {
-                        strncpy(ws_key, key_start, key_len);
-                        ws_key[key_len] = '\0';
-                    }
-                }
-            }
-
-            char accept_key[64] = "";
-            if (ws_key[0]) {
-                strcpy(accept_key, generate_websocket_accept(ws_key));
-            }
-
-            snprintf(resp, sizeof(resp),
-                "HTTP/1.1 101 %s\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "%s%s\r\n"
-                "\r\n",
-                status,
-                ws_key[0] ? "Sec-WebSocket-Accept: " : "",
-                accept_key);
-
-            if (write(client_sock, resp, strlen(resp)) < 0) {
-                close(client_sock);
-                return;
-            }
-        } else {
-            /* Requisição HTTP normal - responde 200 */
-            snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK %s\r\n\r\n", status);
-            if (write(client_sock, resp, strlen(resp)) < 0) {
-                close(client_sock);
-                return;
-            }
+        /* Para todas as outras requisições:
+         * responde 101 com headers completos de WebSocket */
+        char *key_start = strstr(buf, "Sec-WebSocket-Key:");
+        char ws_key[256] = {0};
+        if (key_start) {
+            key_start += 18;
+            while (*key_start == ' ') key_start++;
+            sscanf(key_start, "%255[^\r\n]", ws_key);
         }
+
+        char accept_key[64] = "";
+        if (ws_key[0]) {
+            strcpy(accept_key, generate_websocket_accept(ws_key));
+        }
+
+        /* Monta resposta 101 sempre com Upgrade/Connection */
+        snprintf(resp, sizeof(resp),
+            "HTTP/1.1 101 %s\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "%s%s\r\n"
+            "\r\n",
+            status,
+            ws_key[0] ? "Sec-WebSocket-Accept: " : "",
+            accept_key);
+
+        if (write(client_sock, resp, strlen(resp)) < 0) {
+            close(client_sock); return;
+        }
+
+        /* Consome o request original (GET) para limpar o buffer */
+        if (recv(client_sock, buf, BUFFER_SIZE, 0) <= 0) {
+            close(client_sock); return;
+        }
+        /* NÃO envia 200 OK extra – vai direto para a ponte */
     }
 
-    /* ================================================================
-     * IMPORTANTE: Agora precisamos ler os dados REAIS do cliente
-     * e enviar para o backend, SEM CONSUMIR dados que já foram lidos
-     * ================================================================ */
-
-    /* Detecta backend baseado no peek inicial */
-    BackendRule *backend = detect_backend(buf, peeked);
-    if (!backend) {
-        close(client_sock);
-        return;
-    }
+    /* A partir daqui o fluxo é idêntico: peek do próximo payload → backend */
+    char peek[BUFFER_SIZE] = {0};
+    int  peeked = peek_data(client_sock, peek, sizeof(peek) - 1);
+    BackendRule *backend = detect_backend(peek, peeked);
 
     int server_sock = connect_backend(backend->host, backend->port);
-    if (server_sock < 0) {
-        close(client_sock);
-        return;
-    }
+    if (server_sock < 0) { close(client_sock); return; }
 
-    /* ================================================================
-     * Envia os dados que já foram lidos (peek) para o backend
-     * Mas cuidado: precisamos enviar APENAS os dados que não fazem
-     * parte da requisição HTTP (para WebSocket, são os frames)
-     * ================================================================ */
-
-    if (is_websocket) {
-        /* Para WebSocket, precisamos encontrar onde termina a requisição HTTP
-         * e enviar apenas os dados extras (frames WebSocket) */
-        
-        char *headers_end = strstr(buf, "\r\n\r\n");
-        if (!headers_end) headers_end = strstr(buf, "\n\n");
-        
-        if (headers_end) {
-            size_t headers_len = (headers_end - buf) + 4; // +4 para \r\n\r\n
-            if (peeked > (int)headers_len) {
-                /* Tem dados extras (frames WebSocket) */
-                if (write(server_sock, buf + headers_len, peeked - headers_len) < 0) {
-                    close(server_sock);
-                    close(client_sock);
-                    return;
-                }
-            }
-        }
-    } else {
-        /* Para HTTP normal, envia tudo que foi lido */
-        if (write(server_sock, buf, peeked) < 0) {
-            close(server_sock);
-            close(client_sock);
-            return;
-        }
-    }
-
-    /* ================================================================
-     * Agora inicia o proxy bidirecional para o fluxo contínuo
-     * ================================================================ */
     pthread_t t1, t2;
-    int *c2s = malloc(2 * sizeof(int)); 
-    int *s2c = malloc(2 * sizeof(int));
-    
-    if (c2s && s2c) {
-        c2s[0] = client_sock; 
-        c2s[1] = server_sock;
-        s2c[0] = server_sock; 
-        s2c[1] = client_sock;
+    int *c2s = malloc(2 * sizeof(int)); c2s[0] = client_sock; c2s[1] = server_sock;
+    int *s2c = malloc(2 * sizeof(int)); s2c[0] = server_sock; s2c[1] = client_sock;
 
-        pthread_create(&t1, NULL, transfer, c2s);
-        pthread_create(&t2, NULL, transfer, s2c);
-        pthread_join(t1, NULL);
-        pthread_join(t2, NULL);
-        
-        free(c2s);
-        free(s2c);
-    } else {
-        if (c2s) free(c2s);
-        if (s2c) free(s2c);
-        close(server_sock);
-        close(client_sock);
-        return;
-    }
+    pthread_create(&t1, NULL, transfer, c2s);
+    pthread_create(&t2, NULL, transfer, s2c);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
 
     close(client_sock);
     close(server_sock);
@@ -489,10 +397,9 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
         len   -= 64;
         for (i = 0; i < 16; i++)
             w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
-        for (i = 16; i < 80; i++) {
+        for (i = 16; i < 80; i++)
             w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
             w[i] = (w[i] << 1) | (w[i] >> 31);
-        }
 
         uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
         for (i = 0; i < 80; i++) {
@@ -507,18 +414,18 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
         h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
     }
 
-    memset(msg, 0, sizeof(msg));
     memcpy(msg, input, len);
     msg[len++] = 0x80;
-    
     if (len > 56) {
-        // Processar bloco incompleto
+        memset(msg + len, 0, 64 - len);
+        len = 0;
+        goto process_block;
+    process_block:
         for (i = 0; i < 16; i++)
             w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
-        for (i = 16; i < 80; i++) {
+        for (i = 16; i < 80; i++)
             w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
             w[i] = (w[i] << 1) | (w[i] >> 31);
-        }
 
         uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
         for (i = 0; i < 80; i++) {
@@ -531,39 +438,17 @@ static void SHA1(const unsigned char *input, size_t len, unsigned char output[20
             e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
         }
         h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
-        
-        // Zerar e adicionar comprimento
-        memset(msg, 0, sizeof(msg));
-        len = 0;
+        if (len == 0) goto final;
     }
-    
-    // Adicionar comprimento
+    memset(msg + len, 0, 56 - len);
     uint64_t bits = (uint64_t)(len - 1) * 8;
     msg[56] = bits >> 56; msg[57] = bits >> 48;
     msg[58] = bits >> 40; msg[59] = bits >> 32;
     msg[60] = bits >> 24; msg[61] = bits >> 16;
     msg[62] = bits >> 8;  msg[63] = bits;
-    
-    // Processar bloco final
-    for (i = 0; i < 16; i++)
-        w[i] = ((uint32_t)msg[i*4] << 24) | (msg[i*4+1] << 16) | (msg[i*4+2] << 8) | msg[i*4+3];
-    for (i = 16; i < 80; i++) {
-        w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]);
-        w[i] = (w[i] << 1) | (w[i] >> 31);
-    }
+    goto process_block;
 
-    uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f, k, temp;
-    for (i = 0; i < 80; i++) {
-        if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
-        else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
-        temp = (a << 5) | (a >> 27);
-        temp += f + e + k + w[i];
-        e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
-    }
-    h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
-
+final:
     output[0]  = h0 >> 24; output[1]  = h0 >> 16; output[2]  = h0 >> 8; output[3]  = h0;
     output[4]  = h1 >> 24; output[5]  = h1 >> 16; output[6]  = h1 >> 8; output[7]  = h1;
     output[8]  = h2 >> 24; output[9]  = h2 >> 16; output[10] = h2 >> 8; output[11] = h2;
