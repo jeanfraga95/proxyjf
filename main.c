@@ -314,6 +314,8 @@ static void handle_client(int client_sock) {
         /* Monta resposta 101 sempre com Upgrade/Connection */
         snprintf(resp, sizeof(resp),
             "HTTP/1.1 101 %s\r\n"
+            "HTTP/1.1 101 %s\r\n"
+            "HTTP/1.1 200 OK %s\r\n\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "%s%s\r\n"
