@@ -22,6 +22,7 @@
 #define CONNECT_TIMEOUT  5
 #define MAX_STATUS       32
 #define MAX_BACKEND      32
+#define MAX_REQUESTS 32
 
 /* ------------------------------------------------------------------ */
 /* Estruturas                                                           */
